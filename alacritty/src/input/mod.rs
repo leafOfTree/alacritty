@@ -351,6 +351,30 @@ impl<T: EventListener> Execute<T> for Action {
 
                 ctx.scroll(scroll);
             },
+            Action::ScrollUp
+            | Action::ScrollDown => {
+                let window_id = ctx.window().id();
+                let scheduler = ctx.scheduler_mut();
+                let timer_id = TimerId::new(Topic::SelectionScrolling, window_id);
+                while scheduler.scheduled(timer_id) {
+                    scheduler.unschedule(timer_id);
+                }
+                let line = match self {
+                    Action::ScrollUp => 1,
+                    Action::ScrollDown => -1,
+                    _ => unreachable!()
+                };
+
+                let mut count = 0;
+                let event_interval_millis = 8;
+                let event_total = 40;
+                while count < event_total {
+                    let event = Event::new(EventType::Scroll(Scroll::Delta(line)), Some(window_id));
+                    let scrolling_interval: Duration = Duration::from_millis(event_interval_millis * count);
+                    scheduler.schedule(event, scrolling_interval, false, timer_id);
+                    count += 1;
+                }
+            },
             Action::ScrollLineUp => ctx.scroll(Scroll::Delta(1)),
             Action::ScrollLineDown => ctx.scroll(Scroll::Delta(-1)),
             Action::ScrollToTop => {

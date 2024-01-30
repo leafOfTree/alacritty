@@ -159,6 +159,12 @@ pub enum Action {
     /// Scroll all the way to the bottom.
     ScrollToBottom,
 
+    /// Scroll up smoothly.
+    ScrollUp,
+
+    /// Scroll down smoothly.
+    ScrollDown,
+
     /// Clear the display buffer(s) to remove history.
     ClearHistory,
 
