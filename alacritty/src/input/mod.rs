@@ -366,12 +366,12 @@ impl<T: EventListener> Execute<T> for Action {
                 };
 
                 let mut count = 0;
-                let event_interval_millis = 8;
-                let event_total = 40;
-                while count < event_total {
+                let interval_millis = 8;
+                let total = 40;
+                while count < total {
                     let event = Event::new(EventType::Scroll(Scroll::Delta(line)), Some(window_id));
-                    let scrolling_interval: Duration = Duration::from_millis(event_interval_millis * count);
-                    scheduler.schedule(event, scrolling_interval, false, timer_id);
+                    let interval: Duration = Duration::from_millis(interval_millis * count);
+                    scheduler.schedule(event, interval, false, timer_id);
                     count += 1;
                 }
             },
