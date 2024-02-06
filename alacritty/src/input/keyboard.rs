@@ -211,6 +211,14 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
     /// Handle key release.
     fn key_release(&mut self, key: KeyEvent, mode: TermMode, mods: ModifiersState) {
+        // Stop Action ScrollUp, ScrollDown 
+        let window_id = self.ctx.window().id();
+        let scheduler = self.ctx.scheduler_mut();
+        let timer_id = TimerId::new(Topic::SelectionScrolling, window_id);
+        while scheduler.scheduled(timer_id) {
+            scheduler.unschedule(timer_id);
+        }
+
         if !mode.contains(TermMode::REPORT_EVENT_TYPES)
             || mode.contains(TermMode::VI)
             || self.ctx.search_active()
