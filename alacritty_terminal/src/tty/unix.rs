@@ -5,22 +5,24 @@ use std::fs::File;
 use std::io::{Error, ErrorKind, Read, Result};
 use std::mem::MaybeUninit;
 use std::os::fd::OwnedFd;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Stdio};
+#[cfg(target_os = "macos")]
+use std::path::Path;
+use std::process::{Child, Command};
 use std::sync::Arc;
 use std::{env, ptr};
 
-use libc::{self, c_int, TIOCSCTTY};
+use libc::{F_GETFL, F_SETFL, O_NONBLOCK, TIOCSCTTY, c_int, fcntl};
 use log::error;
 use polling::{Event, PollMode, Poller};
 use rustix_openpty::openpty;
 use rustix_openpty::rustix::termios::Winsize;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use rustix_openpty::rustix::termios::{self, InputModes, OptionalActions};
-use signal_hook::consts as sigconsts;
-use signal_hook::low_level::pipe as signal_pipe;
+use signal_hook::low_level::{pipe as signal_pipe, unregister as unregister_signal};
+use signal_hook::{SigId, consts as sigconsts};
 
 use crate::event::{OnResize, WindowSize};
 use crate::tty::{ChildEvent, EventedPty, EventedReadWrite, Options};
@@ -35,18 +37,7 @@ macro_rules! die {
     ($($arg:tt)*) => {{
         error!($($arg)*);
         std::process::exit(1);
-    }}
-}
-
-/// Get raw fds for master/slave ends of a new PTY.
-fn make_pty(size: Winsize) -> Result<(OwnedFd, OwnedFd)> {
-    let mut window_size = size;
-    window_size.ws_xpixel = 0;
-    window_size.ws_ypixel = 0;
-
-    let ends = openpty(None, Some(&window_size))?;
-
-    Ok((ends.controller, ends.user))
+    }};
 }
 
 /// Really only needed on BSD, but should be fine elsewhere.
@@ -91,11 +82,11 @@ fn get_pw_entry(buf: &mut [i8; 1024]) -> Result<Passwd<'_>> {
     let entry = unsafe { entry.assume_init() };
 
     if status < 0 {
-        return Err(Error::new(ErrorKind::Other, "getpwuid_r failed"));
+        return Err(Error::other("getpwuid_r failed"));
     }
 
     if res.is_null() {
-        return Err(Error::new(ErrorKind::Other, "pw not found"));
+        return Err(Error::other("pw not found"));
     }
 
     // Sanity check.
@@ -113,6 +104,7 @@ pub struct Pty {
     child: Child,
     file: File,
     signals: UnixStream,
+    sig_id: SigId,
 }
 
 impl Pty {
@@ -134,7 +126,7 @@ struct ShellUser {
 
 impl ShellUser {
     /// look for shell, username, longname, and home dir in the respective environment variables
-    /// before falling back on looking in to `passwd`.
+    /// before falling back on looking into `passwd`.
     fn from_env() -> Result<Self> {
         let mut buf = [0; 1024];
         let pw = get_pw_entry(&mut buf);
@@ -168,12 +160,12 @@ impl ShellUser {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn default_shell_command(shell: &str, _user: &str) -> Command {
+fn default_shell_command(shell: &str, _user: &str, _home: &str) -> Command {
     Command::new(shell)
 }
 
 #[cfg(target_os = "macos")]
-fn default_shell_command(shell: &str, user: &str) -> Command {
+fn default_shell_command(shell: &str, user: &str, home: &str) -> Command {
     let shell_name = shell.rsplit('/').next().unwrap();
 
     // On macOS, use the `login` command so the shell will appear as a tty session.
@@ -183,18 +175,32 @@ fn default_shell_command(shell: &str, user: &str) -> Command {
     // `login` normally does this itself, but `-l` disables this.
     let exec = format!("exec -a -{} {}", shell_name, shell);
 
+    // Since we use -l, `login` will not change directory to the user's home. However,
+    // `login` only checks the current working directory for a .hushlogin file, causing
+    // it to miss any in the user's home directory. We can fix this by doing the check
+    // ourselves and passing `-q`
+    let has_home_hushlogin = Path::new(home).join(".hushlogin").exists();
+
     // -f: Bypasses authentication for the already-logged-in user.
     // -l: Skips changing directory to $HOME and prepending '-' to argv[0].
     // -p: Preserves the environment.
+    // -q: Act as if `.hushlogin` exists.
     //
     // XXX: we use zsh here over sh due to `exec -a`.
-    login_command.args(["-flp", user, "/bin/zsh", "-c", &exec]);
+    let flags = if has_home_hushlogin { "-qflp" } else { "-flp" };
+    login_command.args([flags, user, "/bin/zsh", "-fc", &exec]);
     login_command
 }
 
 /// Create a new TTY and return a handle to interact with it.
 pub fn new(config: &Options, window_size: WindowSize, window_id: u64) -> Result<Pty> {
-    let (master, slave) = make_pty(window_size.to_winsize())?;
+    let pty = openpty(None, Some(&window_size.to_winsize()))?;
+    let (master, slave) = (pty.controller, pty.user);
+    from_fd(config, window_id, master, slave)
+}
+
+/// Create a new TTY from a PTY's file descriptors.
+pub fn from_fd(config: &Options, window_id: u64, master: OwnedFd, slave: OwnedFd) -> Result<Pty> {
     let master_fd = master.as_raw_fd();
     let slave_fd = slave.as_raw_fd();
 
@@ -212,32 +218,41 @@ pub fn new(config: &Options, window_size: WindowSize, window_id: u64) -> Result<
         cmd.args(shell.args.as_slice());
         cmd
     } else {
-        default_shell_command(&user.shell, &user.user)
+        default_shell_command(&user.shell, &user.user, &user.home)
     };
 
     // Setup child stdin/stdout/stderr as slave fd of PTY.
-    // Ownership of fd is transferred to the Stdio structs and will be closed by them at the end of
-    // this scope. (It is not an issue that the fd is closed three times since File::drop ignores
-    // error on libc::close.).
-    builder.stdin(unsafe { Stdio::from_raw_fd(slave_fd) });
-    builder.stderr(unsafe { Stdio::from_raw_fd(slave_fd) });
-    builder.stdout(unsafe { Stdio::from_raw_fd(slave_fd) });
+    builder.stdin(slave.try_clone()?);
+    builder.stderr(slave.try_clone()?);
+    builder.stdout(slave);
 
     // Setup shell environment.
     let window_id = window_id.to_string();
     builder.env("ALACRITTY_WINDOW_ID", &window_id);
     builder.env("USER", user.user);
     builder.env("HOME", user.home);
-
     // Set Window ID for clients relying on X11 hacks.
     builder.env("WINDOWID", window_id);
+    for (key, value) in &config.env {
+        builder.env(key, value);
+    }
 
+    // Prevent child processes from inheriting linux-specific startup notification env.
+    builder.env_remove("XDG_ACTIVATION_TOKEN");
+    builder.env_remove("DESKTOP_STARTUP_ID");
+
+    let working_directory = config.working_directory.clone();
     unsafe {
         builder.pre_exec(move || {
             // Create a new process group.
             let err = libc::setsid();
             if err == -1 {
-                return Err(Error::new(ErrorKind::Other, "Failed to set session id"));
+                return Err(Error::other("Failed to set session id"));
+            }
+
+            // Set working directory, ignoring invalid paths.
+            if let Some(working_directory) = working_directory.as_ref() {
+                let _ = env::set_current_dir(working_directory);
             }
 
             set_controlling_terminal(slave_fd);
@@ -257,19 +272,14 @@ pub fn new(config: &Options, window_size: WindowSize, window_id: u64) -> Result<
         });
     }
 
-    // Handle set working directory option.
-    if let Some(dir) = &config.working_directory {
-        builder.current_dir(dir);
-    }
-
     // Prepare signal handling before spawning child.
-    let signals = {
+    let (signals, sig_id) = {
         let (sender, recv) = UnixStream::pair()?;
 
         // Register the recv end of the pipe for SIGCHLD.
-        signal_pipe::register(sigconsts::SIGCHLD, sender)?;
+        let sig_id = signal_pipe::register(sigconsts::SIGCHLD, sender)?;
         recv.set_nonblocking(true)?;
-        recv
+        (recv, sig_id)
     };
 
     match builder.spawn() {
@@ -280,9 +290,7 @@ pub fn new(config: &Options, window_size: WindowSize, window_id: u64) -> Result<
                 set_nonblocking(master_fd);
             }
 
-            let mut pty = Pty { child, file: File::from(master), signals };
-            pty.on_resize(window_size);
-            Ok(pty)
+            Ok(Pty { child, file: File::from(master), signals, sig_id })
         },
         Err(err) => Err(Error::new(
             err.kind(),
@@ -301,6 +309,10 @@ impl Drop for Pty {
         unsafe {
             libc::kill(self.child.id() as i32, libc::SIGHUP);
         }
+
+        // Clear signal-hook handler.
+        unregister_signal(self.sig_id);
+
         let _ = self.child.wait();
     }
 }
@@ -371,7 +383,7 @@ impl EventedPty for Pty {
         let mut buf = [0u8; 1];
         if let Err(err) = self.signals.read(&mut buf) {
             if err.kind() != ErrorKind::WouldBlock {
-                error!("Error reading from signal pipe: {}", err);
+                error!("Error reading from signal pipe: {err}");
             }
             return None;
         }
@@ -379,11 +391,11 @@ impl EventedPty for Pty {
         // Match on the child process.
         match self.child.try_wait() {
             Err(err) => {
-                error!("Error checking child process termination: {}", err);
+                error!("Error checking child process termination: {err}");
                 None
             },
             Ok(None) => None,
-            Ok(_) => Some(ChildEvent::Exited),
+            Ok(exit_status) => Some(ChildEvent::Exited(exit_status.and_then(|s| s.code()))),
         }
     }
 }
@@ -422,9 +434,7 @@ impl ToWinsize for WindowSize {
 }
 
 unsafe fn set_nonblocking(fd: c_int) {
-    use libc::{fcntl, F_GETFL, F_SETFL, O_NONBLOCK};
-
-    let res = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+    let res = unsafe { fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK) };
     assert_eq!(res, 0);
 }
 

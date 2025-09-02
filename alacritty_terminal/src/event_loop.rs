@@ -5,10 +5,9 @@ use std::collections::VecDeque;
 use std::fmt::{self, Display, Formatter};
 use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
-use std::marker::Send;
 use std::num::NonZeroUsize;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -18,8 +17,8 @@ use polling::{Event as PollingEvent, Events, PollMode};
 use crate::event::{self, Event, EventListener, WindowSize};
 use crate::sync::FairMutex;
 use crate::term::Term;
-use crate::vte::ansi;
 use crate::{thread, tty};
+use vte::ansi;
 
 /// Max bytes to read from the PTY before forced terminal synchronization.
 pub(crate) const READ_BUFFER_SIZE: usize = 0x10_0000;
@@ -51,7 +50,7 @@ pub struct EventLoop<T: tty::EventedPty, U: EventListener> {
     tx: Sender<Msg>,
     terminal: Arc<FairMutex<Term<U>>>,
     event_proxy: U,
-    hold: bool,
+    drain_on_exit: bool,
     ref_test: bool,
 }
 
@@ -65,20 +64,21 @@ where
         terminal: Arc<FairMutex<Term<U>>>,
         event_proxy: U,
         pty: T,
-        hold: bool,
+        drain_on_exit: bool,
         ref_test: bool,
-    ) -> EventLoop<T, U> {
+    ) -> io::Result<EventLoop<T, U>> {
         let (tx, rx) = mpsc::channel();
-        EventLoop {
-            poll: polling::Poller::new().expect("create Poll").into(),
+        let poll = polling::Poller::new()?.into();
+        Ok(EventLoop {
+            poll,
             pty,
             tx,
             rx: PeekableReceiver::new(rx),
             terminal,
             event_proxy,
-            hold,
+            drain_on_exit,
             ref_test,
-        }
+        })
     }
 
     pub fn channel(&self) -> EventLoopSender {
@@ -151,9 +151,7 @@ where
             }
 
             // Parse the incoming bytes.
-            for byte in &buf[..unprocessed] {
-                state.parser.advance(&mut **terminal, *byte);
-            }
+            state.parser.advance(&mut **terminal, &buf[..unprocessed]);
 
             processed += unprocessed;
             unprocessed = 0;
@@ -213,8 +211,9 @@ where
             let mut interest = PollingEvent::readable(0);
 
             // Register TTY through EventedRW interface.
-            unsafe {
-                self.pty.register(&self.poll, interest, poll_opts).unwrap();
+            if let Err(err) = unsafe { self.pty.register(&self.poll, interest, poll_opts) } {
+                error!("Event loop registration error: {err}");
+                return (self, state);
             }
 
             let mut events = Events::with_capacity(NonZeroUsize::new(1024).unwrap());
@@ -235,7 +234,10 @@ where
                 if let Err(err) = self.poll.wait(&mut events, timeout) {
                     match err.kind() {
                         ErrorKind::Interrupted => continue,
-                        _ => panic!("EventLoop polling error: {err:?}"),
+                        _ => {
+                            error!("Event loop polling error: {err}");
+                            break 'event_loop;
+                        },
                     }
                 }
 
@@ -254,15 +256,15 @@ where
                 for event in events.iter() {
                     match event.key {
                         tty::PTY_CHILD_EVENT_TOKEN => {
-                            if let Some(tty::ChildEvent::Exited) = self.pty.next_child_event() {
-                                if self.hold {
-                                    // With hold enabled, make sure the PTY is drained.
-                                    let _ = self.pty_read(&mut state, &mut buf, pipe.as_mut());
-                                } else {
-                                    // Without hold, shutdown the terminal.
-                                    self.terminal.lock().exit();
+                            if let Some(tty::ChildEvent::Exited(code)) = self.pty.next_child_event()
+                            {
+                                if let Some(code) = code {
+                                    self.event_proxy.send_event(Event::ChildExit(code));
                                 }
-
+                                if self.drain_on_exit {
+                                    let _ = self.pty_read(&mut state, &mut buf, pipe.as_mut());
+                                }
+                                self.terminal.lock().exit();
                                 self.event_proxy.send_event(Event::Wakeup);
                                 break 'event_loop;
                             }
@@ -287,14 +289,14 @@ where
                                         continue;
                                     }
 
-                                    error!("Error reading from PTY in event loop: {}", err);
+                                    error!("Error reading from PTY in event loop: {err}");
                                     break 'event_loop;
                                 }
                             }
 
                             if event.writable {
                                 if let Err(err) = self.pty_write(&mut state) {
-                                    error!("Error writing to PTY in event loop: {}", err);
+                                    error!("Error writing to PTY in event loop: {err}");
                                     break 'event_loop;
                                 }
                             }
@@ -336,7 +338,7 @@ impl event::Notify for Notifier {
     {
         let bytes = bytes.into();
         // Terminal hangs if we send 0 bytes through.
-        if bytes.len() == 0 {
+        if bytes.is_empty() {
             return;
         }
 

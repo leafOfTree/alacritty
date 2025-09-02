@@ -1,19 +1,20 @@
 use std::cmp::max;
+use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use alacritty_config::SerdeReplace;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueHint};
-use log::{self, error, LevelFilter};
+use log::{LevelFilter, error};
 use serde::{Deserialize, Serialize};
 use toml::Value;
 
 use alacritty_terminal::tty::Options as PtyOptions;
 
+use crate::config::UiConfig;
 use crate::config::ui_config::Program;
 use crate::config::window::{Class, Identity};
-use crate::config::UiConfig;
 use crate::logging::LOG_TARGET_IPC_CONFIG;
 
 /// CLI options for the main Alacritty executable.
@@ -25,7 +26,7 @@ pub struct Options {
     pub print_events: bool,
 
     /// Generates ref test.
-    #[clap(long)]
+    #[clap(long, conflicts_with("daemon"))]
     pub ref_test: bool,
 
     /// X11 window ID to embed Alacritty within (decimal or hexadecimal with "0x" prefix).
@@ -61,6 +62,10 @@ pub struct Options {
     #[clap(short, conflicts_with("quiet"), action = ArgAction::Count)]
     verbose: u8,
 
+    /// Do not spawn an initial window.
+    #[clap(long)]
+    pub daemon: bool,
+
     /// CLI options for config overrides.
     #[clap(skip)]
     pub config_options: ParsedOptions,
@@ -87,11 +92,10 @@ impl Options {
     /// Override configuration file with options from the CLI.
     pub fn override_config(&mut self, config: &mut UiConfig) {
         #[cfg(unix)]
-        {
-            config.ipc_socket |= self.socket.is_some();
+        if self.socket.is_some() {
+            config.ipc_socket = Some(true);
         }
 
-        config.window.dynamic_title &= self.window_options.window_identity.title.is_none();
         config.window.embed = self.embed.as_ref().and_then(|embed| parse_hex_or_decimal(embed));
         config.debug.print_events |= self.print_events;
         config.debug.log_level = max(config.debug.log_level, self.log_level());
@@ -131,7 +135,7 @@ fn parse_class(input: &str) -> Result<Class, String> {
     let (general, instance) = match input.split_once(',') {
         // Warn the user if they've passed too many values.
         Some((_, instance)) if instance.contains(',') => {
-            return Err(String::from("Too many parameters"))
+            return Err(String::from("Too many parameters"));
         },
         Some((general, instance)) => (general, instance),
         None => (input, input),
@@ -177,7 +181,7 @@ impl TerminalOptions {
             if working_directory.is_dir() {
                 pty_config.working_directory = Some(working_directory.to_owned());
             } else {
-                error!("Invalid working directory: {:?}", working_directory);
+                error!("Invalid working directory: {working_directory:?}");
             }
         }
 
@@ -185,7 +189,7 @@ impl TerminalOptions {
             pty_config.shell = Some(command.into());
         }
 
-        pty_config.hold |= self.hold;
+        pty_config.drain_on_exit |= self.hold;
     }
 }
 
@@ -194,7 +198,10 @@ impl From<TerminalOptions> for PtyOptions {
         PtyOptions {
             working_directory: options.working_directory.take(),
             shell: options.command().map(Into::into),
-            hold: options.hold,
+            drain_on_exit: options.hold,
+            env: HashMap::new(),
+            #[cfg(target_os = "windows")]
+            escape_args: false,
         }
     }
 }
@@ -215,10 +222,10 @@ impl WindowIdentity {
     /// Override the [`WindowIdentity`]'s fields with the [`WindowOptions`].
     pub fn override_identity_config(&self, identity: &mut Identity) {
         if let Some(title) = &self.title {
-            identity.title = title.clone();
+            identity.title.clone_from(title);
         }
         if let Some(class) = &self.class {
-            identity.class = class.clone();
+            identity.class.clone_from(class);
         }
     }
 }
@@ -253,6 +260,9 @@ pub enum SocketMessage {
 
     /// Update the Alacritty configuration.
     Config(IpcConfig),
+
+    /// Read runtime Alacritty configuration.
+    GetConfig(IpcGetConfig),
 }
 
 /// Migrate the configuration file.
@@ -295,6 +305,11 @@ pub struct WindowOptions {
     /// The window tabbing identifier to use when building a window.
     pub window_tabbing_id: Option<String>,
 
+    #[clap(skip)]
+    #[cfg(not(any(target_os = "macos", windows)))]
+    /// `ActivationToken` that we pass to winit.
+    pub activation_token: Option<String>,
+
     /// Override configuration file options [example: 'cursor.style="Beam"'].
     #[clap(short = 'o', long, num_args = 1..)]
     option: Vec<String>,
@@ -324,6 +339,17 @@ pub struct IpcConfig {
     /// Clear all runtime configuration changes.
     #[clap(short, long, conflicts_with = "options")]
     pub reset: bool,
+}
+
+/// Parameters to the `get-config` IPC subcommand.
+#[cfg(unix)]
+#[derive(Args, Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct IpcGetConfig {
+    /// Window ID for the config request.
+    ///
+    /// Use `-1` to get the global config.
+    #[clap(short, long, allow_hyphen_values = true, env = "ALACRITTY_WINDOW_ID")]
+    pub window_id: Option<i128>,
 }
 
 /// Parsed CLI config overrides.
@@ -360,7 +386,7 @@ impl ParsedOptions {
                 Err(err) => {
                     error!(
                         target: LOG_TARGET_IPC_CONFIG,
-                        "Unable to override option '{}': {}", option, err
+                        "Unable to override option '{option}': {err}"
                     );
                     self.config_options.swap_remove(i);
                 },
@@ -421,19 +447,6 @@ mod tests {
         Options::default().override_config(&mut config);
 
         assert_eq!(old_dynamic_title, config.window.dynamic_title);
-    }
-
-    #[test]
-    fn dynamic_title_overridden_by_options() {
-        let mut config = UiConfig::default();
-
-        let title = Some(String::from("foo"));
-        let window_identity = WindowIdentity { title, ..WindowIdentity::default() };
-        let new_window_options = WindowOptions { window_identity, ..WindowOptions::default() };
-        let mut options = Options { window_options: new_window_options, ..Options::default() };
-        options.override_config(&mut config);
-
-        assert!(!config.window.dynamic_title);
     }
 
     #[test]
@@ -536,7 +549,7 @@ mod tests {
             let generated = String::from_utf8_lossy(&generated);
 
             let mut completion = String::new();
-            let mut file = File::open(format!("../extra/completions/{}", file)).unwrap();
+            let mut file = File::open(format!("../extra/completions/{file}")).unwrap();
             file.read_to_string(&mut completion).unwrap();
 
             assert_eq!(generated, completion);

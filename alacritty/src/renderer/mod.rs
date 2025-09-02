@@ -1,24 +1,24 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{fmt, ptr};
 
 use ahash::RandomState;
 use crossfont::Metrics;
 use glutin::context::{ContextApi, GlContext, PossiblyCurrentContext};
 use glutin::display::{GetGlDisplay, GlDisplay};
-use log::{debug, error, info, warn, LevelFilter};
+use log::{LevelFilter, debug, info};
 use unicode_width::UnicodeWidthChar;
 
 use alacritty_terminal::index::Point;
 use alacritty_terminal::term::cell::Flags;
 
 use crate::config::debug::RendererPreference;
+use crate::display::SizeInfo;
 use crate::display::color::Rgb;
 use crate::display::content::RenderableCell;
-use crate::display::SizeInfo;
 use crate::gl;
 use crate::renderer::rects::{RectRenderer, RenderRect};
 use crate::renderer::shader::ShaderError;
@@ -32,14 +32,6 @@ pub use text::{GlyphCache, LoaderApi};
 
 use shader::ShaderVersion;
 use text::{Gles2Renderer, Glsl3Renderer, TextRenderer};
-
-macro_rules! cstr {
-    ($s:literal) => {
-        // This can be optimized into an no-op with pre-allocated NUL-terminated bytes.
-        unsafe { std::ffi::CStr::from_ptr(concat!($s, "\0").as_ptr().cast()) }
-    };
-}
-pub(crate) use cstr;
 
 /// Whether the OpenGL functions have been loaded.
 pub static GL_FUNS_LOADED: AtomicBool = AtomicBool::new(false);
@@ -66,10 +58,10 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Shader(err) => {
-                write!(f, "There was an error initializing the shaders: {}", err)
+                write!(f, "There was an error initializing the shaders: {err}")
             },
             Error::Other(err) => {
-                write!(f, "{}", err)
+                write!(f, "{err}")
             },
         }
     }
@@ -97,6 +89,7 @@ enum TextRendererProvider {
 pub struct Renderer {
     text_renderer: TextRendererProvider,
     rect_renderer: RectRenderer,
+    robustness: bool,
 }
 
 /// Wrapper around gl::GetString with error checking and reporting.
@@ -111,9 +104,9 @@ fn gl_get_string(
                 Ok(CStr::from_ptr(string_ptr as *const _).to_string_lossy())
             },
             gl::INVALID_ENUM => {
-                Err(format!("OpenGL error requesting {}: invalid enum", description).into())
+                Err(format!("OpenGL error requesting {description}: invalid enum").into())
             },
-            error_id => Err(format!("OpenGL error {} requesting {}", error_id, description).into()),
+            error_id => Err(format!("OpenGL error {error_id} requesting {description}").into()),
         }
     }
 }
@@ -143,6 +136,9 @@ impl Renderer {
 
         info!("Running on {renderer}");
         info!("OpenGL version {gl_version}, shader_version {shader_version}");
+
+        // Check if robustness is supported.
+        let robustness = Self::supports_robustness();
 
         let is_gles_context = matches!(context.context_api(), ContextApi::Gles(_));
 
@@ -175,7 +171,7 @@ impl Renderer {
             }
         }
 
-        Ok(Self { text_renderer, rect_renderer })
+        Ok(Self { text_renderer, rect_renderer, robustness })
     }
 
     pub fn draw_cells<I: Iterator<Item = RenderableCell>>(
@@ -205,25 +201,24 @@ impl Renderer {
         size_info: &SizeInfo,
         glyph_cache: &mut GlyphCache,
     ) {
-        let mut skip_next = false;
+        let mut wide_char_spacer = false;
         let cells = string_chars.enumerate().filter_map(|(i, character)| {
-            if skip_next {
-                skip_next = false;
+            let flags = if wide_char_spacer {
+                wide_char_spacer = false;
                 return None;
-            }
-
-            let mut flags = Flags::empty();
-            if character.width() == Some(2) {
-                flags.insert(Flags::WIDE_CHAR);
-                // Wide character is always followed by a spacer, so skip it.
-                skip_next = true;
-            }
+            } else if character.width() == Some(2) {
+                // The spacer is always following the wide char.
+                wide_char_spacer = true;
+                Flags::WIDE_CHAR
+            } else {
+                Flags::empty()
+            };
 
             Some(RenderableCell {
                 point: Point::new(point.line, point.column + i),
                 character,
                 extra: None,
-                flags: Flags::empty(),
+                flags,
                 bg_alpha: 1.0,
                 fg,
                 bg,
@@ -279,6 +274,49 @@ impl Renderer {
                 alpha,
             );
             gl::Clear(gl::COLOR_BUFFER_BIT);
+        }
+    }
+
+    /// Get the context reset status.
+    pub fn was_context_reset(&self) -> bool {
+        // If robustness is not supported, don't use its functions.
+        if !self.robustness {
+            return false;
+        }
+
+        let status = unsafe { gl::GetGraphicsResetStatus() };
+        if status == gl::NO_ERROR {
+            false
+        } else {
+            let reason = match status {
+                gl::GUILTY_CONTEXT_RESET_KHR => "guilty",
+                gl::INNOCENT_CONTEXT_RESET_KHR => "innocent",
+                gl::UNKNOWN_CONTEXT_RESET_KHR => "unknown",
+                _ => "invalid",
+            };
+
+            info!("GPU reset ({reason})");
+
+            true
+        }
+    }
+
+    fn supports_robustness() -> bool {
+        let mut notification_strategy = 0;
+        if GlExtensions::contains("GL_KHR_robustness") {
+            unsafe {
+                gl::GetIntegerv(gl::RESET_NOTIFICATION_STRATEGY_KHR, &mut notification_strategy);
+            }
+        } else {
+            notification_strategy = gl::NO_RESET_NOTIFICATION_KHR as gl::types::GLint;
+        }
+
+        if notification_strategy == gl::LOSE_CONTEXT_ON_RESET_KHR as gl::types::GLint {
+            info!("GPU reset notifications are enabled");
+            true
+        } else {
+            info!("GPU reset notifications are disabled");
+            false
         }
     }
 
@@ -350,7 +388,7 @@ impl GlExtensions {
 
 extern "system" fn gl_debug_log(
     _: gl::types::GLenum,
-    kind: gl::types::GLenum,
+    _: gl::types::GLenum,
     _: gl::types::GLuint,
     _: gl::types::GLenum,
     _: gl::types::GLsizei,
@@ -358,11 +396,5 @@ extern "system" fn gl_debug_log(
     _: *mut std::os::raw::c_void,
 ) {
     let msg = unsafe { CStr::from_ptr(msg).to_string_lossy() };
-    match kind {
-        gl::DEBUG_TYPE_ERROR | gl::DEBUG_TYPE_UNDEFINED_BEHAVIOR => {
-            error!("[gl_render] {}", msg)
-        },
-        gl::DEBUG_TYPE_DEPRECATED_BEHAVIOR => warn!("[gl_render] {}", msg),
-        _ => debug!("[gl_render] {}", msg),
-    }
+    debug!("[gl_render] {msg}");
 }

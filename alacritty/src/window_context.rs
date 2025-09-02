@@ -8,16 +8,17 @@ use std::mem;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
-use glutin::config::GetGlConfig;
+use glutin::config::Config as GlutinConfig;
 use glutin::display::GetGlDisplay;
 #[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
 use glutin::platform::x11::X11GlConfigExt;
 use log::info;
-use raw_window_handle::HasRawDisplayHandle;
 use serde_json as json;
 use winit::event::{Event as WinitEvent, Modifiers, WindowEvent};
-use winit::event_loop::{EventLoopProxy, EventLoopWindowTarget};
+use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
+use winit::raw_window_handle::HasDisplayHandle;
 use winit::window::WindowId;
 
 use alacritty_terminal::event::Event as TerminalEvent;
@@ -32,8 +33,8 @@ use alacritty_terminal::tty;
 use crate::cli::{ParsedOptions, WindowOptions};
 use crate::clipboard::Clipboard;
 use crate::config::UiConfig;
-use crate::display::window::Window;
 use crate::display::Display;
+use crate::display::window::Window;
 use crate::event::{
     ActionContext, Event, EventProxy, InlineSearchState, Mouse, SearchState, TouchPurpose,
 };
@@ -51,6 +52,7 @@ pub struct WindowContext {
     event_queue: Vec<WinitEvent<Event>>,
     terminal: Arc<FairMutex<Term<EventProxy>>>,
     cursor_blink_timed_out: bool,
+    prev_bell_cmd: Option<Instant>,
     modifiers: Modifiers,
     inline_search_state: InlineSearchState,
     search_state: SearchState,
@@ -70,12 +72,12 @@ pub struct WindowContext {
 impl WindowContext {
     /// Create initial window context that does bootstrapping the graphics API we're going to use.
     pub fn initial(
-        event_loop: &EventLoopWindowTarget<Event>,
+        event_loop: &ActiveEventLoop,
         proxy: EventLoopProxy<Event>,
         config: Rc<UiConfig>,
-        options: WindowOptions,
+        mut options: WindowOptions,
     ) -> Result<Self, Box<dyn Error>> {
-        let raw_display_handle = event_loop.raw_display_handle();
+        let raw_display_handle = event_loop.display_handle().unwrap().as_raw();
 
         let mut identity = config.window.identity.clone();
         options.window_identity.override_identity_config(&mut identity);
@@ -83,7 +85,7 @@ impl WindowContext {
         // Windows has different order of GL platform initialization compared to any other platform;
         // it requires the window first.
         #[cfg(windows)]
-        let window = Window::new(event_loop, &config, &identity)?;
+        let window = Window::new(event_loop, &config, &identity, &mut options)?;
         #[cfg(windows)]
         let raw_window_handle = Some(window.raw_window_handle());
 
@@ -102,10 +104,9 @@ impl WindowContext {
             event_loop,
             &config,
             &identity,
+            &mut options,
             #[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
             gl_config.x11_visual(),
-            #[cfg(target_os = "macos")]
-            &options.window_tabbing_id,
         )?;
 
         // Create context.
@@ -119,45 +120,38 @@ impl WindowContext {
 
     /// Create additional context with the graphics platform other windows are using.
     pub fn additional(
-        &self,
-        event_loop: &EventLoopWindowTarget<Event>,
+        gl_config: &GlutinConfig,
+        event_loop: &ActiveEventLoop,
         proxy: EventLoopProxy<Event>,
         config: Rc<UiConfig>,
-        options: WindowOptions,
+        mut options: WindowOptions,
         config_overrides: ParsedOptions,
     ) -> Result<Self, Box<dyn Error>> {
-        // Get any window and take its GL config and display to build a new context.
-        let (gl_display, gl_config) = {
-            let gl_context = self.display.gl_context();
-            (gl_context.display(), gl_context.config())
-        };
+        let gl_display = gl_config.display();
 
         let mut identity = config.window.identity.clone();
         options.window_identity.override_identity_config(&mut identity);
+
+        // Check if new window will be opened as a tab.
+        // This must be done before `Window::new()`, which unsets `window_tabbing_id`.
+        #[cfg(target_os = "macos")]
+        let tabbed = options.window_tabbing_id.is_some();
+        #[cfg(not(target_os = "macos"))]
+        let tabbed = false;
 
         let window = Window::new(
             event_loop,
             &config,
             &identity,
+            &mut options,
             #[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
             gl_config.x11_visual(),
-            #[cfg(target_os = "macos")]
-            &options.window_tabbing_id,
         )?;
 
         // Create context.
         let raw_window_handle = window.raw_window_handle();
-        let gl_context = renderer::platform::create_gl_context(
-            &gl_display,
-            &gl_config,
-            Some(raw_window_handle),
-        )?;
-
-        // Check if new window will be opened as a tab.
-        #[cfg(target_os = "macos")]
-        let tabbed = options.window_tabbing_id.is_some();
-        #[cfg(not(target_os = "macos"))]
-        let tabbed = false;
+        let gl_context =
+            renderer::platform::create_gl_context(&gl_display, gl_config, Some(raw_window_handle))?;
 
         let display = Display::new(window, gl_context, &config, tabbed)?;
 
@@ -221,9 +215,9 @@ impl WindowContext {
             Arc::clone(&terminal),
             event_proxy.clone(),
             pty,
-            pty_config.hold,
+            pty_config.drain_on_exit,
             config.debug.ref_test,
-        );
+        )?;
 
         // The event loop channel allows write requests from the event processor
         // to be sent to the pty loop and ultimately written to the pty.
@@ -249,6 +243,7 @@ impl WindowContext {
             config,
             notifier: Notifier(loop_tx),
             cursor_blink_timed_out: Default::default(),
+            prev_bell_cmd: Default::default(),
             inline_search_state: Default::default(),
             message_buffer: Default::default(),
             window_config: Default::default(),
@@ -337,6 +332,12 @@ impl WindowContext {
         self.dirty = true;
     }
 
+    /// Get reference to the window's configuration.
+    #[cfg(unix)]
+    pub fn config(&self) -> &UiConfig {
+        &self.config
+    }
+
     /// Clear the window config overrides.
     #[cfg(unix)]
     pub fn reset_window_config(&mut self, config: Rc<UiConfig>) {
@@ -399,7 +400,7 @@ impl WindowContext {
     /// Process events for this terminal window.
     pub fn handle_event(
         &mut self,
-        event_loop: &EventLoopWindowTarget<Event>,
+        #[cfg(target_os = "macos")] event_loop: &ActiveEventLoop,
         event_proxy: &EventLoopProxy<Event>,
         clipboard: &mut Clipboard,
         scheduler: &mut Scheduler,
@@ -427,6 +428,7 @@ impl WindowContext {
 
         let context = ActionContext {
             cursor_blink_timed_out: &mut self.cursor_blink_timed_out,
+            prev_bell_cmd: &mut self.prev_bell_cmd,
             message_buffer: &mut self.message_buffer,
             inline_search_state: &mut self.inline_search_state,
             search_state: &mut self.search_state,
@@ -445,6 +447,7 @@ impl WindowContext {
             preserve_title: self.preserve_title,
             config: &self.config,
             event_proxy,
+            #[cfg(target_os = "macos")]
             event_loop,
             clipboard,
             scheduler,

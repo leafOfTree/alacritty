@@ -5,18 +5,159 @@ The sections should follow the order `Packaging`, `Added`, `Changed`, `Fixed` an
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## 0.14.0-dev
+Notable changes to the `alacritty_terminal` crate are documented in its
+[CHANGELOG](./alacritty_terminal/CHANGELOG.md).
+
+## 0.17.0-dev
+
+### Changed
+
+- Don't highlight hints on hover when the mouse cursor is hidden
+
+## 0.16.0
+
+### Packaging
+
+- Minimum Rust version has been bumped to 1.85.0
+
+### Added
+
+- Vi motions `*`, `#`, `{`, and `}`
+- IPC config retrieval using `alacritty msg get-config`
+- Multi-sequence touch zoom sequences
+- Vi action `Y` keybind, yank to the end of line
+- Add `/etc/alacritty/alacritty.toml` fallback for system wide configuration
+
+### Changed
+
+- Hide login message if `~/.hushlogin` is present
+- Improve rendering of rounded corners with builtin box drawing
+
+### Fixed
+
+- Crash when OpenGL context resets
+- Modifier keys clearing selection with kitty keyboard protocol enabled
+- `glyph_offset.y` not applied to strikeout
+- `Enter`,`Tab`, `Backspace` not disambiguated with `shift` in kitty keyboard's disambiguate mode
+- Hint bindings not respecting IPC overrides
+- Search matching a wrapping fullwidth character in the last column
+- Crash when `AppleFontSmoothing` option is not present on macOS
+- Origin mode (DECOM) not moving cursor to the origin point
+- Unresponsiveness when spamming the bell character with a bell command enabled
+- `window.startup_mode` applied to existing window when opening a new tab on macOS
+
+## 0.15.1
+
+### Changed
+
+- Error out when socket fails to create with `--daemon`
+- Default URL hints now stop before backslashes
+
+### Fixed
+
+- Modifiers being out of sync for fast/synthetic input on X11
+- Child process creation failing while inside a deleted directory
+- Shifted key reported without a shift when using kitty keyboard protocol
+
+## 0.15.0
+
+### Added
+
+- Config option `window.level = "AlwaysOnTop"` to force Alacritty to always be the toplevel window
+- Escape sequence to move cursor forward tabs ( CSI Ps I )
+- Pass activation token in `alacritty msg create-window` on Wayland/X11
+
+### Changed
+
+- Always focus new windows on macOS
+- Don't switch to semantic/line selection when control is pressed
+- Always emit `1` for the first parameter when having modifiers in kitty keyboard protocol
+
+### Fixed
+
+- Mouse/Vi cursor hint highlighting broken on the terminal cursor line
+- Hint launcher opening arbitrary text, when terminal content changed while opening
+- `SemanticRight`/`SemanticLeft` vi motions breaking with wide semantic escape characters
+- `alacritty migrate` crashing with recursive toml imports
+- Migrating nonexistent toml import breaking the entire migration
+- First daemon mode window ignoring window options passed through CLI
+- Report of Enter/Tab/Backspace in kitty keyboard's report event types mode
+- Crash when pressing certain modifier keys on macOS 15+
+- Cut off wide characters in preedit string
+
+## 0.14.0
+
+### Packaging
+
+- Minimum Rust version has been bumped to 1.74.0
+
+### Added
+
+- Support relative path imports from config files
+- `alacritty migrate` support for TOML configuration changes
+- Headless mode using `alacritty --daemon`
+
+### Changed
+
+- Pressing `Alt` with unicode input will now add `ESC` like for ASCII input
+- Decorations use opaque style and system window background on macOS
+- No longer source `~/.zshenv` on macOS
+- Moved config options `import`, `working_directory`, `live_config_reload`, and `ipc_socket`
+    to the new `general` section
+- Moved config option `shell` to `terminal.shell`
+- `ctrl+shift+u` binding to open links to `ctrl+shift+o` to avoid collisions with IMEs
+- Use `Beam` cursor for single char cursor inside the IME preview
+
+### Fixed
+
+- Crash when trying to create a new tab without decorations enabled
+- New window being treated as focused when it's not on Wayland
+- IME preview blending into text below it
+- Dynamic title disabled for new windows when initial one has title as CLI option
+- While terminal in mouse mode, mouse bindings that used the shift modifier and
+  had multiple actions only performed the first action
+- Leaking FDs when closing windows on Unix systems
+- Config emitting errors for nonexistent import paths
+- Kitty keyboard protocol reporting shifted key codes
+- Broken search with words broken across line boundary on the first character
+- Config import changes not being live reloaded
+- Cursor color requests with default cursor colors
+- Fullwidth semantic escape characters
+- Windows app icon now displays properly in old alt+tab on Windows
+- Alacritty not being properly activated with startup notify
+- Invalid URL highlights after terminal scrolling
+- Hollow block cursor not spanning multiple chars being edited inside the IME preview
+- Vi inline search only working for direct key input without modifiers
+
+## 0.13.2
+
+### Added
+
+- Default `Home`/`End` bindings in Vi mode mapped to `First`/`Last` respectively
 
 ### Fixed
 
 - CLI env variables clearing configuration file variables
 - Vi inline search/semantic selection expanding across newlines
 - C0 and C1 codes being emitted in associated text when using kitty keyboard
+- Occasional hang on startup with some Wayland compositors
+- Missing key for `NumpadDecimal` in key bindings
+- Scrolling content upwards moving lines into history when it shouldn't
+- Sticky keys not working sometimes on X11
+- Modifiers occasionally getting desynced on X11
+- Autokey no longer working with alacritty on X11
+- Freeze when moving window between monitors on Xfwm
+- Mouse cursor not changing on Wayland when cursor theme uses legacy cursor icon names
+- Config keys are available under proper names
+- Build failure when compiling with x11 feature on NetBSD
+- Hint `Select` action selecting the entire line for URL escapes
+- Kitty encoding used for regular keys when they don't carry text
 
 ### Changed
 
 - No unused-key warnings will be emitted for OS-specific config keys
 - Use built-in font for sextant symbols from `U+1FB00` to `U+1FB3B`
+- Kitty encoding is not used anymore for uncommon keys unless the protocol enabled
 
 ## 0.13.1
 
@@ -278,7 +419,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Terminal not exiting sometimes after closing all windows on macOS
 - CPU usage spikes due to mouse movements for unfocused windows on X11/Windows
 - First window on macOS not tabbed with system prefer tabs setting
-- Window being treaten as focused by default on Wayland
+- Window being treated as focused by default on Wayland
 
 ### Removed
 
@@ -302,7 +443,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - OSC 104 not clearing colors when second parameter is empty
 - Builtin font lines not contiguous when `font.offset` is used
 - `font.glyph_offset` is no longer applied on builtin font
-- Buili-in font arcs alignment
+- Built-in font arcs alignment
 - Repeated permission prompts on M1 macs
 - Colors being slightly off when using `colors.transparent_background_colors`
 
@@ -468,7 +609,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Performance of scrolling regions with offset from the bottom
 - Extra mouse buttons are no longer ignored on Wayland
 - Numpad arrow keys are now properly recognized on Wayland
-- Compilation when targetting aarch64-apple-darwin
+- Compilation when targeting aarch64-apple-darwin
 - Window not being completely opaque on Windows
 - Window being always on top during alt-tab on Windows
 - Cursor position not reported to apps when mouse is moved with button held outside of window
@@ -634,7 +775,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Reflow of cursor during resize
 - Cursor color escape ignored when its color is set to inverted in the config
 - Fontconfig's `autohint` and `hinting` options being ignored
-- Ingoring of default FreeType properties
+- Ignoring of default FreeType properties
 - Alacritty crashing at startup when the configured font does not exist
 - Font size rounding error
 - Opening URLs while search is active
@@ -842,7 +983,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Block URL highlight while a selection is active
 - Bindings for Alt + F1-F12
 - Discard scrolling region escape with bottom above top
-- Opacity always applying to cells with their background color matching the teriminal background
+- Opacity always applying to cells with their background color matching the terminal background
 - Allow semicolons when setting titles using an OSC
 - Background always opaque on X11
 - Skipping redraws on PTY update
@@ -912,7 +1053,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
-- Double-width characters in URLs only being highlit on the left half
+- Double-width characters in URLs only being highlighted on the left half
 - PTY size not getting updated when message bar is shown
 - Text Cursor disappearing
 - Incorrect positioning of zero-width characters over double-width characters

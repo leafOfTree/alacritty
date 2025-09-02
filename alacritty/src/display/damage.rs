@@ -189,6 +189,17 @@ impl FrameDamage {
             self.lines.push(LineDamageBounds::undamaged(line, num_cols));
         }
     }
+
+    /// Check if a range is damaged.
+    #[inline]
+    pub fn intersects(&self, start: Point<usize>, end: Point<usize>) -> bool {
+        let start_line = &self.lines[start.line];
+        let end_line = &self.lines[end.line];
+        self.full
+            || (start_line.left..=start_line.right).contains(&start.column)
+            || (end_line.left..=end_line.right).contains(&end.column)
+            || (start.line + 1..end.line).any(|line| self.lines[line].is_damaged())
+    }
 }
 
 /// Convert viewport `y` coordinate to [`Rect`] damage coordinate.
@@ -227,12 +238,12 @@ impl<'a> RenderDamageIterator<'a> {
     fn overdamage(size_info: &SizeInfo<u32>, mut rect: Rect) -> Rect {
         rect.x = (rect.x - size_info.cell_width() as i32).max(0);
         rect.width = cmp::min(
-            size_info.width() as i32 - rect.x,
+            (size_info.width() as i32 - rect.x).max(0),
             rect.width + 2 * size_info.cell_width() as i32,
         );
         rect.y = (rect.y - size_info.cell_height() as i32 / 2).max(0);
         rect.height = cmp::min(
-            size_info.height() as i32 - rect.y,
+            (size_info.height() as i32 - rect.y).max(0),
             rect.height + size_info.cell_height() as i32,
         );
 
@@ -240,7 +251,7 @@ impl<'a> RenderDamageIterator<'a> {
     }
 }
 
-impl<'a> Iterator for RenderDamageIterator<'a> {
+impl Iterator for RenderDamageIterator<'_> {
     type Item = Rect;
 
     fn next(&mut self) -> Option<Rect> {
@@ -333,6 +344,11 @@ mod tests {
             ),
             rect
         );
+
+        // Test out of bounds coord clamping.
+        let rect = Rect::new(bound * 2, bound * 2, rect_side, rect_side);
+        let rect = RenderDamageIterator::overdamage(&size_info, rect);
+        assert_eq!(Rect::new(bound * 2 - cell_size, bound * 2 - cell_size / 2, 0, 0), rect);
     }
 
     #[test]

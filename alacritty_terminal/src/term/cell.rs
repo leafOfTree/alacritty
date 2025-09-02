@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use bitflags::bitflags;
 #[cfg(feature = "serde")]
@@ -124,9 +124,7 @@ impl ResetDiscriminant<Color> for Cell {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct CellExtra {
     zerowidth: Vec<char>,
-
     underline_color: Option<Color>,
-
     hyperlink: Option<Hyperlink>,
 }
 
@@ -185,7 +183,7 @@ impl Cell {
             && self
                 .extra
                 .as_ref()
-                .map_or(true, |extra| extra.zerowidth.is_empty() && extra.hyperlink.is_none())
+                .is_none_or(|extra| extra.zerowidth.is_empty() && extra.hyperlink.is_none())
         {
             self.extra = None;
         } else {
@@ -203,9 +201,10 @@ impl Cell {
     /// Set hyperlink.
     pub fn set_hyperlink(&mut self, hyperlink: Option<Hyperlink>) {
         let should_drop = hyperlink.is_none()
-            && self.extra.as_ref().map_or(true, |extra| {
-                extra.zerowidth.is_empty() && extra.underline_color.is_none()
-            });
+            && self
+                .extra
+                .as_ref()
+                .is_none_or(|extra| extra.zerowidth.is_empty() && extra.underline_color.is_none());
 
         if should_drop {
             self.extra = None;

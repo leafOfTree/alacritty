@@ -4,16 +4,16 @@ use std::mem;
 use std::ops::RangeInclusive;
 
 use log::{debug, warn};
-use regex_automata::hybrid::dfa::{Builder, Cache, Config, DFA};
 pub use regex_automata::hybrid::BuildError;
+use regex_automata::hybrid::dfa::{Builder, Cache, Config, DFA};
 use regex_automata::nfa::thompson::Config as ThompsonConfig;
 use regex_automata::util::syntax::Config as SyntaxConfig;
 use regex_automata::{Anchored, Input, MatchKind};
 
 use crate::grid::{BidirectionalIterator, Dimensions, GridIterator, Indexed};
 use crate::index::{Boundary, Column, Direction, Point, Side};
-use crate::term::cell::{Cell, Flags};
 use crate::term::Term;
+use crate::term::cell::{Cell, Flags};
 
 /// Used to match equal brackets, when performing a bracket-pair selection.
 const BRACKET_PAIRS: [(char, char); 4] = [('(', ')'), ('[', ']'), ('{', '}'), ('<', '>')];
@@ -293,13 +293,13 @@ impl<T> Term<T> {
         let mut state = regex.dfa.start_state_forward(&mut regex.cache, &input).unwrap();
 
         let mut iter = self.grid.iter_from(start);
-        let mut last_wrapped = false;
         let mut regex_match = None;
         let mut done = false;
 
         let mut cell = iter.cell();
         self.skip_fullwidth(&mut iter, &mut cell, regex.direction);
         let mut c = cell.c;
+        let mut last_wrapped = iter.cell().flags.contains(Flags::WRAPLINE);
 
         let mut point = iter.point();
         let mut last_point = point;
@@ -401,8 +401,8 @@ impl<T> Term<T> {
 
             self.skip_fullwidth(&mut iter, &mut cell, regex.direction);
 
-            let wrapped = cell.flags.contains(Flags::WRAPLINE);
             c = cell.c;
+            let wrapped = iter.cell().flags.contains(Flags::WRAPLINE);
 
             last_point = mem::replace(&mut point, iter.point());
 
@@ -516,7 +516,14 @@ impl<T> Term<T> {
     #[must_use]
     pub fn semantic_search_left(&self, point: Point) -> Point {
         match self.inline_search_left(point, self.semantic_escape_chars()) {
-            Ok(point) => self.grid.iter_from(point).next().map_or(point, |cell| cell.point),
+            // If we found a match, reverse for at least one cell, skipping over wide cell spacers.
+            Ok(point) => {
+                let wide_spacer = Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
+                self.grid
+                    .iter_from(point)
+                    .find(|cell| !cell.flags.intersects(wide_spacer))
+                    .map_or(point, |cell| cell.point)
+            },
             Err(point) => point,
         }
     }
@@ -538,7 +545,7 @@ impl<T> Term<T> {
         let mut iter = self.grid.iter_from(point);
         let last_column = self.columns() - 1;
 
-        let wide = Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
+        let wide_spacer = Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
         while let Some(cell) = iter.prev() {
             if cell.point.column == last_column && !cell.flags.contains(Flags::WRAPLINE) {
                 break;
@@ -546,7 +553,7 @@ impl<T> Term<T> {
 
             point = cell.point;
 
-            if !cell.flags.intersects(wide) && needles.contains(cell.c) {
+            if !cell.flags.intersects(wide_spacer) && needles.contains(cell.c) {
                 return Ok(point);
             }
         }
@@ -559,7 +566,7 @@ impl<T> Term<T> {
         // Limit the starting point to the last line in the history
         point.line = max(point.line, self.topmost_line());
 
-        let wide = Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
+        let wide_spacer = Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
         let last_column = self.columns() - 1;
 
         // Immediately stop if start point in on line break.
@@ -570,7 +577,7 @@ impl<T> Term<T> {
         for cell in self.grid.iter_from(point) {
             point = cell.point;
 
-            if !cell.flags.intersects(wide) && needles.contains(cell.c) {
+            if !cell.flags.intersects(wide_spacer) && needles.contains(cell.c) {
                 return Ok(point);
             }
 
@@ -649,7 +656,7 @@ impl<'a, T> RegexIter<'a, T> {
     }
 }
 
-impl<'a, T> Iterator for RegexIter<'a, T> {
+impl<T> Iterator for RegexIter<'_, T> {
     type Item = Match;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -682,8 +689,8 @@ mod tests {
     use super::*;
 
     use crate::index::{Column, Line};
-    use crate::term::test::{mock_term, TermSize};
     use crate::term::Config;
+    use crate::term::test::{TermSize, mock_term};
 
     #[test]
     fn regex_right() {
@@ -1154,5 +1161,91 @@ mod tests {
         let end = term.semantic_search_right(Point::new(Line(1), Column(0)));
         assert_eq!(start, Point::new(Line(1), Column(0)));
         assert_eq!(end, Point::new(Line(1), Column(2)));
+    }
+
+    #[test]
+    fn inline_word_search() {
+        #[rustfmt::skip]
+        let term = mock_term("\
+            word word word word w\n\
+            ord word word word\
+        ");
+
+        let mut regex = RegexSearch::new("word").unwrap();
+        let start = Point::new(Line(1), Column(4));
+        let end = Point::new(Line(0), Column(0));
+        let match_start = Point::new(Line(0), Column(20));
+        let match_end = Point::new(Line(1), Column(2));
+        assert_eq!(term.regex_search_left(&mut regex, start, end), Some(match_start..=match_end));
+    }
+
+    #[test]
+    fn fullwidth_semantic() {
+        #[rustfmt::skip]
+        let mut term = mock_term("test－x－test");
+        term.config.semantic_escape_chars = "－".into();
+
+        let start = term.semantic_search_left(Point::new(Line(0), Column(6)));
+        let end = term.semantic_search_right(Point::new(Line(0), Column(6)));
+        assert_eq!(start, Point::new(Line(0), Column(6)));
+        assert_eq!(end, Point::new(Line(0), Column(6)));
+    }
+
+    #[test]
+    fn fullwidth_across_lines() {
+        let term = mock_term("a🦇\n🦇b");
+
+        let mut regex = RegexSearch::new("🦇🦇").unwrap();
+        let start = Point::new(Line(0), Column(0));
+        let end = Point::new(Line(1), Column(2));
+        let match_start = Point::new(Line(0), Column(1));
+        let match_end = Point::new(Line(1), Column(1));
+        assert_eq!(term.regex_search_right(&mut regex, start, end), Some(match_start..=match_end));
+
+        let mut regex = RegexSearch::new("🦇🦇").unwrap();
+        let start = Point::new(Line(1), Column(2));
+        let end = Point::new(Line(0), Column(0));
+        let match_start = Point::new(Line(1), Column(1));
+        let match_end = Point::new(Line(0), Column(1));
+        assert_eq!(term.regex_search_left(&mut regex, start, end), Some(match_end..=match_start));
+    }
+
+    #[test]
+    fn fullwidth_into_halfwidth_across_lines() {
+        let term = mock_term("a🦇\nxab");
+
+        let mut regex = RegexSearch::new("🦇x").unwrap();
+        let start = Point::new(Line(0), Column(0));
+        let end = Point::new(Line(1), Column(2));
+        let match_start = Point::new(Line(0), Column(1));
+        let match_end = Point::new(Line(1), Column(0));
+        assert_eq!(term.regex_search_right(&mut regex, start, end), Some(match_start..=match_end));
+
+        let mut regex = RegexSearch::new("🦇x").unwrap();
+        let start = Point::new(Line(1), Column(2));
+        let end = Point::new(Line(0), Column(0));
+        let match_start = Point::new(Line(1), Column(0));
+        let match_end = Point::new(Line(0), Column(1));
+        assert_eq!(term.regex_search_left(&mut regex, start, end), Some(match_end..=match_start));
+    }
+
+    #[test]
+    fn no_spacer_fullwidth_linewrap() {
+        let mut term = mock_term("abY\nxab");
+        term.grid_mut()[Line(0)][Column(2)].c = '🦇';
+
+        let mut regex = RegexSearch::new("🦇x").unwrap();
+        let start = Point::new(Line(0), Column(0));
+        let end = Point::new(Line(1), Column(2));
+        let match_start = Point::new(Line(0), Column(2));
+        let match_end = Point::new(Line(1), Column(0));
+        assert_eq!(term.regex_search_right(&mut regex, start, end), Some(match_start..=match_end));
+
+        let mut regex = RegexSearch::new("🦇x").unwrap();
+        let start = Point::new(Line(1), Column(2));
+        let end = Point::new(Line(0), Column(0));
+        let match_start = Point::new(Line(1), Column(0));
+        let match_end = Point::new(Line(0), Column(2));
+        assert_eq!(term.regex_search_left(&mut regex, start, end), Some(match_end..=match_start));
     }
 }

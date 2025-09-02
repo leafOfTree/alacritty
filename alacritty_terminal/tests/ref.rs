@@ -24,7 +24,7 @@ macro_rules! ref_tests {
                 ref_test(&test_path);
             }
         )*
-    }
+    };
 }
 
 ref_tests! {
@@ -71,6 +71,8 @@ ref_tests! {
     zerowidth
     zsh_tab_completion
     erase_in_line
+    scroll_in_region_up_preserves_history
+    origin_goto
 }
 
 fn read_u8<P>(path: P) -> Vec<u8>
@@ -111,9 +113,7 @@ fn ref_test(dir: &Path) {
     let mut terminal = Term::new(options, &size, Mock);
     let mut parser: ansi::Processor = ansi::Processor::new();
 
-    for byte in recording {
-        parser.advance(&mut terminal, byte);
-    }
+    parser.advance(&mut terminal, &recording);
 
     // Truncate invisible lines from the grid.
     let mut term_grid = terminal.grid().clone();

@@ -6,22 +6,22 @@ use log::info;
 
 use alacritty_terminal::term::cell::Flags;
 
-use crate::display::content::RenderableCell;
 use crate::display::SizeInfo;
+use crate::display::content::RenderableCell;
 use crate::gl;
 use crate::gl::types::*;
+use crate::renderer::Error;
 use crate::renderer::shader::{ShaderProgram, ShaderVersion};
-use crate::renderer::{cstr, Error};
 
-use super::atlas::{Atlas, ATLAS_SIZE};
+use super::atlas::{ATLAS_SIZE, Atlas};
 use super::{
     Glyph, LoadGlyph, LoaderApi, RenderingGlyphFlags, RenderingPass, TextRenderApi,
     TextRenderBatch, TextRenderer, TextShader,
 };
 
 // Shader source.
-pub static TEXT_SHADER_F: &str = include_str!("../../../res/glsl3/text.f.glsl");
-static TEXT_SHADER_V: &str = include_str!("../../../res/glsl3/text.v.glsl");
+pub const TEXT_SHADER_F: &str = include_str!("../../../res/glsl3/text.f.glsl");
+const TEXT_SHADER_V: &str = include_str!("../../../res/glsl3/text.v.glsl");
 
 /// Maximum items to be drawn in a batch.
 const BATCH_MAX: usize = 0x1_0000;
@@ -215,7 +215,7 @@ pub struct RenderApi<'a> {
     program: &'a mut TextShaderProgram,
 }
 
-impl<'a> TextRenderApi<Batch> for RenderApi<'a> {
+impl TextRenderApi<Batch> for RenderApi<'_> {
     fn batch(&mut self) -> &mut Batch {
         self.batch
     }
@@ -261,7 +261,7 @@ impl<'a> TextRenderApi<Batch> for RenderApi<'a> {
     }
 }
 
-impl<'a> LoadGlyph for RenderApi<'a> {
+impl LoadGlyph for RenderApi<'_> {
     fn load_glyph(&mut self, rasterized: &RasterizedGlyph) -> Glyph {
         Atlas::load_glyph(self.active_tex, self.atlas, self.current_atlas, rasterized)
     }
@@ -271,7 +271,7 @@ impl<'a> LoadGlyph for RenderApi<'a> {
     }
 }
 
-impl<'a> Drop for RenderApi<'a> {
+impl Drop for RenderApi<'_> {
     fn drop(&mut self) {
         if !self.batch.is_empty() {
             self.render_batch();
@@ -426,9 +426,9 @@ impl TextShaderProgram {
     pub fn new(shader_version: ShaderVersion) -> Result<TextShaderProgram, Error> {
         let program = ShaderProgram::new(shader_version, None, TEXT_SHADER_V, TEXT_SHADER_F)?;
         Ok(Self {
-            u_projection: program.get_uniform_location(cstr!("projection"))?,
-            u_cell_dim: program.get_uniform_location(cstr!("cellDim"))?,
-            u_rendering_pass: program.get_uniform_location(cstr!("renderingPass"))?,
+            u_projection: program.get_uniform_location(c"projection")?,
+            u_cell_dim: program.get_uniform_location(c"cellDim")?,
+            u_rendering_pass: program.get_uniform_location(c"renderingPass")?,
             program,
         })
     }

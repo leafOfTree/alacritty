@@ -1,5 +1,6 @@
 //! TTY related functionality.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::{env, io};
@@ -27,8 +28,18 @@ pub struct Options {
     /// Shell startup directory.
     pub working_directory: Option<PathBuf>,
 
-    /// Remain open after child process exits.
-    pub hold: bool,
+    /// Drain the child process output before exiting the terminal.
+    pub drain_on_exit: bool,
+
+    /// Extra environment variables.
+    pub env: HashMap<String, String>,
+
+    /// Specifies whether the Windows shell arguments should be escaped.
+    ///
+    /// - When `true`: Arguments will be escaped according to the standard C runtime rules.
+    /// - When `false`: Arguments will be passed raw without additional escaping.
+    #[cfg(target_os = "windows")]
+    pub escape_args: bool,
 }
 
 /// Shell options.
@@ -46,9 +57,10 @@ impl Shell {
     }
 }
 
-/// This trait defines the behaviour needed to read and/or write to a stream.
-/// It defines an abstraction over polling's interface in order to allow either one
-/// read/write object or a separate read and write object.
+/// Stream read and/or write behavior.
+///
+/// This defines an abstraction over polling's interface in order to allow either
+/// one read/write object or a separate read and write object.
 pub trait EventedReadWrite {
     type Reader: io::Read;
     type Writer: io::Write;
@@ -67,8 +79,8 @@ pub trait EventedReadWrite {
 /// Events concerning TTY child processes.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ChildEvent {
-    /// Indicates the child has exited.
-    Exited,
+    /// Indicates the child has exited, with an error code if available.
+    Exited(Option<i32>),
 }
 
 /// A pseudoterminal (or PTY).
@@ -89,14 +101,10 @@ pub fn setup_env() {
     // default to 'xterm-256color'. May be overridden by user's config
     // below.
     let terminfo = if terminfo_exists("alacritty") { "alacritty" } else { "xterm-256color" };
-    env::set_var("TERM", terminfo);
+    unsafe { env::set_var("TERM", terminfo) };
 
     // Advertise 24-bit color support.
-    env::set_var("COLORTERM", "truecolor");
-
-    // Prevent child processes from inheriting startup notification env.
-    env::remove_var("DESKTOP_STARTUP_ID");
-    env::remove_var("XDG_ACTIVATION_TOKEN");
+    unsafe { env::set_var("COLORTERM", "truecolor") };
 }
 
 /// Check if a terminfo entry exists on the system.

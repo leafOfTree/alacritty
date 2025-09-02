@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::num::NonZeroU32;
 use std::ops::Deref;
 use std::{cmp, mem};
 
@@ -12,7 +13,7 @@ use alacritty_terminal::term::{self, RenderableContent as TerminalContent, Term,
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor};
 
 use crate::config::UiConfig;
-use crate::display::color::{CellRgb, List, Rgb, DIM_FACTOR};
+use crate::display::color::{CellRgb, DIM_FACTOR, List, Rgb};
 use crate::display::hint::{self, HintState};
 use crate::display::{Display, SizeInfo};
 use crate::event::SearchState;
@@ -134,8 +135,13 @@ impl<'a> RenderableContent<'a> {
             text_color = self.config.colors.primary.background;
         }
 
+        let width = if cell.flags.contains(Flags::WIDE_CHAR) {
+            NonZeroU32::new(2).unwrap()
+        } else {
+            NonZeroU32::new(1).unwrap()
+        };
         RenderableCursor {
-            is_wide: cell.flags.contains(Flags::WIDE_CHAR),
+            width,
             shape: self.cursor_shape,
             point: self.cursor_point,
             cursor_color,
@@ -144,7 +150,7 @@ impl<'a> RenderableContent<'a> {
     }
 }
 
-impl<'a> Iterator for RenderableContent<'a> {
+impl Iterator for RenderableContent<'_> {
     type Item = RenderableCell;
 
     /// Gets the next renderable cell.
@@ -212,7 +218,7 @@ impl RenderableCell {
             Self::compute_bg_alpha(content.config, cell.bg)
         };
 
-        let is_selected = content.terminal_content.selection.map_or(false, |selection| {
+        let is_selected = content.terminal_content.selection.is_some_and(|selection| {
             selection.contains_cell(
                 &cell,
                 content.terminal_content.cursor.point,
@@ -256,8 +262,8 @@ impl RenderableCell {
                 bg = content.color(NamedColor::Foreground as usize);
                 bg_alpha = 1.0;
             }
-        } else if content.search.as_mut().map_or(false, |search| search.advance(cell.point)) {
-            let focused = content.focused_match.map_or(false, |fm| fm.contains(&cell.point));
+        } else if content.search.as_mut().is_some_and(|search| search.advance(cell.point)) {
+            let focused = content.focused_match.is_some_and(|fm| fm.contains(&cell.point));
             let (config_fg, config_bg) = if focused {
                 (colors.search.focused_match.foreground, colors.search.focused_match.background)
             } else {
@@ -328,7 +334,7 @@ impl RenderableCell {
                 _ => rgb.into(),
             },
             Color::Named(ansi) => {
-                match (config.draw_bold_text_with_bright_colors(), flags & Flags::DIM_BOLD) {
+                match (config.colors.draw_bold_text_with_bright_colors, flags & Flags::DIM_BOLD) {
                     // If no bright foreground is set, treat it like the BOLD flag doesn't exist.
                     (_, Flags::DIM_BOLD)
                         if ansi == NamedColor::Foreground
@@ -348,7 +354,7 @@ impl RenderableCell {
             },
             Color::Indexed(idx) => {
                 let idx = match (
-                    config.draw_bold_text_with_bright_colors(),
+                    config.colors.draw_bold_text_with_bright_colors,
                     flags & Flags::DIM_BOLD,
                     idx,
                 ) {
@@ -396,7 +402,7 @@ pub struct RenderableCursor {
     shape: CursorShape,
     cursor_color: Rgb,
     text_color: Rgb,
-    is_wide: bool,
+    width: NonZeroU32,
     point: Point<usize>,
 }
 
@@ -405,15 +411,20 @@ impl RenderableCursor {
         let shape = CursorShape::Hidden;
         let cursor_color = Rgb::default();
         let text_color = Rgb::default();
-        let is_wide = false;
+        let width = NonZeroU32::new(1).unwrap();
         let point = Point::default();
-        Self { shape, cursor_color, text_color, is_wide, point }
+        Self { shape, cursor_color, text_color, width, point }
     }
 }
 
 impl RenderableCursor {
-    pub fn new(point: Point<usize>, shape: CursorShape, cursor_color: Rgb, is_wide: bool) -> Self {
-        Self { shape, cursor_color, text_color: cursor_color, is_wide, point }
+    pub fn new(
+        point: Point<usize>,
+        shape: CursorShape,
+        cursor_color: Rgb,
+        width: NonZeroU32,
+    ) -> Self {
+        Self { shape, cursor_color, text_color: cursor_color, width, point }
     }
 
     pub fn color(&self) -> Rgb {
@@ -424,8 +435,8 @@ impl RenderableCursor {
         self.shape
     }
 
-    pub fn is_wide(&self) -> bool {
-        self.is_wide
+    pub fn width(&self) -> NonZeroU32 {
+        self.width
     }
 
     pub fn point(&self) -> Point<usize> {
@@ -442,7 +453,7 @@ struct Hint<'a> {
     labels: &'a Vec<Vec<char>>,
 }
 
-impl<'a> Hint<'a> {
+impl Hint<'_> {
     /// Advance the hint iterator.
     ///
     /// If the point is within a hint, the keyboard shortcut character that should be displayed at
@@ -532,7 +543,7 @@ impl<'a> HintMatches<'a> {
     }
 }
 
-impl<'a> Deref for HintMatches<'a> {
+impl Deref for HintMatches<'_> {
     type Target = [Match];
 
     fn deref(&self) -> &Self::Target {

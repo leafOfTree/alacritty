@@ -4,7 +4,7 @@ use std::str::FromStr;
 
 use log::trace;
 use serde::de::{Error as SerdeError, Visitor};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use alacritty_config_derive::SerdeReplace;
 use alacritty_terminal::term::color::COUNT;
@@ -18,7 +18,7 @@ pub const DIM_FACTOR: f32 = 0.66;
 #[derive(Copy, Clone)]
 pub struct List([Rgb; COUNT]);
 
-impl<'a> From<&'a Colors> for List {
+impl From<&'_ Colors> for List {
     fn from(colors: &Colors) -> List {
         // Type inference fails without this annotation.
         let mut list = List([Rgb::default(); COUNT]);
@@ -216,10 +216,7 @@ impl Add<Rgb> for Rgb {
     }
 }
 
-/// Deserialize an Rgb from a hex string.
-///
-/// This is *not* the deserialize impl for Rgb since we want a symmetric
-/// serialize/deserialize impl for ref tests.
+/// Deserialize Rgb color from a hex string.
 impl<'de> Deserialize<'de> for Rgb {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -235,7 +232,7 @@ impl<'de> Deserialize<'de> for Rgb {
             b: u8,
         }
 
-        impl<'a> Visitor<'a> for RgbVisitor {
+        impl Visitor<'_> for RgbVisitor {
             type Value = Rgb;
 
             fn expecting(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -264,6 +261,16 @@ impl<'de> Deserialize<'de> for Rgb {
 
         // Deserialize from hex notation (either 0xff00ff or #ff00ff).
         value.deserialize_str(RgbVisitor).map_err(D::Error::custom)
+    }
+}
+
+/// Serialize Rgb color to a hex string.
+impl Serialize for Rgb {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
     }
 }
 
@@ -300,10 +307,11 @@ impl FromStr for Rgb {
 }
 
 /// RGB color optionally referencing the cell's foreground or background.
-#[derive(SerdeReplace, Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(SerdeReplace, Serialize, Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CellRgb {
     CellForeground,
     CellBackground,
+    #[serde(untagged)]
     Rgb(Rgb),
 }
 
@@ -331,7 +339,7 @@ impl<'de> Deserialize<'de> for CellRgb {
         const EXPECTING: &str = "CellForeground, CellBackground, or hex color like #ff00ff";
 
         struct CellRgbVisitor;
-        impl<'a> Visitor<'a> for CellRgbVisitor {
+        impl Visitor<'_> for CellRgbVisitor {
             type Value = CellRgb;
 
             fn expecting(&self, f: &mut Formatter<'_>) -> fmt::Result {

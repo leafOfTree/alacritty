@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::mem;
 
 use winit::event::{ElementState, KeyEvent};
 #[cfg(target_os = "macos")]
@@ -12,7 +11,7 @@ use alacritty_terminal::event::EventListener;
 use alacritty_terminal::term::TermMode;
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 
-use crate::config::{Action, BindingKey, BindingMode};
+use crate::config::{Action, BindingKey, BindingMode, KeyBinding};
 use crate::event::TYPING_SEARCH_DELAY;
 use crate::input::{ActionContext, Execute, Processor};
 use crate::scheduler::{TimerId, Topic};
@@ -29,6 +28,9 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         let mods = self.ctx.modifiers().state();
 
         if key.state == ElementState::Released {
+            if self.ctx.inline_search_state().char_pending {
+                self.ctx.window().set_ime_allowed(true);
+            }
             self.key_release(key, mode, mods);
             return;
         }
@@ -45,15 +47,8 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
         // First key after inline search is captured.
         let inline_state = self.ctx.inline_search_state();
-        if mem::take(&mut inline_state.char_pending) {
-            if let Some(c) = text.chars().next() {
-                inline_state.character = Some(c);
-
-                // Immediately move to the captured character.
-                self.ctx.inline_search_next();
-            }
-
-            // Ignore all other characters in `text`.
+        if inline_state.char_pending {
+            self.ctx.inline_search_input(text);
             return;
         }
 
@@ -82,6 +77,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         let mods = if self.alt_send_esc(&key, text) { mods } else { mods & !ModifiersState::ALT };
 
         let build_key_sequence = Self::should_build_sequence(&key, text, mode, mods);
+        let is_modifier_key = Self::is_modifier_key(&key);
 
         let bytes = if build_key_sequence {
             build_sequence(key, mods, mode)
@@ -97,7 +93,10 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
         // Write only if we have something to write.
         if !bytes.is_empty() {
-            self.ctx.on_terminal_input_start();
+            // Don't clear selection/scroll down when writing escaped modifier keys.
+            if !is_modifier_key {
+                self.ctx.on_terminal_input_start();
+            }
             self.ctx.write_to_pty(bytes);
         }
     }
@@ -126,8 +125,18 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                     self.ctx.modifiers().state().alt_key()
                 }
             },
-            _ => text.len() == 1 && alt_send_esc,
+            _ => alt_send_esc && text.chars().count() == 1,
         }
+    }
+
+    fn is_modifier_key(key: &KeyEvent) -> bool {
+        matches!(
+            key.logical_key.as_ref(),
+            Key::Named(NamedKey::Shift)
+                | Key::Named(NamedKey::Control)
+                | Key::Named(NamedKey::Alt)
+                | Key::Named(NamedKey::Super)
+        )
     }
 
     /// Check whether we should try to build escape sequence for the [`KeyEvent`].
@@ -143,8 +152,15 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
         let disambiguate = mode.contains(TermMode::DISAMBIGUATE_ESC_CODES)
             && (key.logical_key == Key::Named(NamedKey::Escape)
-                || (!mods.is_empty() && mods != ModifiersState::SHIFT)
-                || key.location == KeyLocation::Numpad);
+                || key.location == KeyLocation::Numpad
+                || (!mods.is_empty()
+                    && (mods != ModifiersState::SHIFT
+                        || matches!(
+                            key.logical_key,
+                            Key::Named(NamedKey::Tab)
+                                | Key::Named(NamedKey::Enter)
+                                | Key::Named(NamedKey::Backspace)
+                        ))));
 
         match key.logical_key {
             _ if disambiguate => true,
@@ -187,9 +203,8 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             key.logical_key.clone()
         };
 
-        for i in 0..self.ctx.config().key_bindings().len() {
-            let binding = &self.ctx.config().key_bindings()[i];
-
+        // Get the action of a key binding.
+        let mut binding_action = |binding: &KeyBinding| {
             let key = match (&binding.trigger, &logical_key) {
                 (BindingKey::Scancode(_), _) => BindingKey::Scancode(key.physical_key),
                 (_, code) => {
@@ -202,7 +217,30 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                 *suppress_chars.get_or_insert(true) &= binding.action != Action::ReceiveChar;
 
                 // Binding was triggered; run the action.
-                binding.action.clone().execute(&mut self.ctx);
+                Some(binding.action.clone())
+            } else {
+                None
+            }
+        };
+
+        // Trigger matching key bindings.
+        for i in 0..self.ctx.config().key_bindings().len() {
+            let binding = &self.ctx.config().key_bindings()[i];
+            if let Some(action) = binding_action(binding) {
+                action.execute(&mut self.ctx);
+            }
+        }
+
+        // Trigger key bindings for hints.
+        for i in 0..self.ctx.config().hints.enabled.len() {
+            let hint = &self.ctx.config().hints.enabled[i];
+            let binding = match hint.binding.as_ref() {
+                Some(binding) => binding.key_binding(hint),
+                None => continue,
+            };
+
+            if let Some(action) = binding_action(binding) {
+                action.execute(&mut self.ctx);
             }
         }
 
@@ -231,20 +269,15 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         let text = key.text_with_all_modifiers().unwrap_or_default();
         let mods = if self.alt_send_esc(&key, text) { mods } else { mods & !ModifiersState::ALT };
 
-        let bytes: Cow<'static, [u8]> = match key.logical_key.as_ref() {
-            // NOTE: Echo the key back on release to follow kitty/foot behavior. When
-            // KEYBOARD_REPORT_ALL_KEYS_AS_ESC is used, we build proper escapes for
-            // the keys below.
-            _ if mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) => {
-                build_sequence(key, mods, mode).into()
+        let bytes = match key.logical_key.as_ref() {
+            Key::Named(NamedKey::Enter)
+            | Key::Named(NamedKey::Tab)
+            | Key::Named(NamedKey::Backspace)
+                if !mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) =>
+            {
+                return;
             },
-            // Winit uses different keys for `Backspace` so we expliictly specify the
-            // values, instead of using what was passed to us from it.
-            Key::Named(NamedKey::Tab) => [b'\t'].as_slice().into(),
-            Key::Named(NamedKey::Enter) => [b'\r'].as_slice().into(),
-            Key::Named(NamedKey::Backspace) => [b'\x7f'].as_slice().into(),
-            Key::Named(NamedKey::Escape) => [b'\x1b'].as_slice().into(),
-            _ => build_sequence(key, mods, mode).into(),
+            _ => build_sequence(key, mods, mode),
         };
 
         self.ctx.write_to_pty(bytes);
@@ -292,7 +325,8 @@ fn build_sequence(key: KeyEvent, mods: ModifiersState, mode: TermMode) -> Vec<u8
 
     let sequence_base = context
         .try_build_numpad(&key)
-        .or_else(|| context.try_build_named(&key))
+        .or_else(|| context.try_build_named_kitty(&key))
+        .or_else(|| context.try_build_named_normal(&key, associated_text.is_some()))
         .or_else(|| context.try_build_control_char_or_mod(&key, &mut modifiers))
         .or_else(|| context.try_build_textual(&key, associated_text));
 
@@ -301,7 +335,7 @@ fn build_sequence(key: KeyEvent, mods: ModifiersState, mode: TermMode) -> Vec<u8
         _ => return Vec::new(),
     };
 
-    let mut payload = format!("\x1b[{}", payload);
+    let mut payload = format!("\x1b[{payload}");
 
     // Add modifiers information.
     if kitty_event_type || !modifiers.is_empty() || associated_text.is_some() {
@@ -354,23 +388,26 @@ impl SequenceBuilder {
         associated_text: Option<&str>,
     ) -> Option<SequenceBase> {
         let character = match key.logical_key.as_ref() {
-            Key::Character(character) => character,
+            Key::Character(character) if self.kitty_seq => character,
             _ => return None,
         };
 
         if character.chars().count() == 1 {
-            let character = character.chars().next().unwrap();
-            let base_character = character.to_lowercase().next().unwrap();
+            let shift = self.modifiers.contains(SequenceModifiers::SHIFT);
 
-            let alternate_key_code = u32::from(character);
-            let mut unicode_key_code = u32::from(base_character);
+            let ch = character.chars().next().unwrap();
+            let unshifted_ch = if shift { ch.to_lowercase().next().unwrap() } else { ch };
+
+            let alternate_key_code = u32::from(ch);
+            let mut unicode_key_code = u32::from(unshifted_ch);
 
             // Try to get the base for keys which change based on modifier, like `1` for `!`.
-            match key.key_without_modifiers().as_ref() {
-                Key::Character(unmodded) if alternate_key_code == unicode_key_code => {
-                    unicode_key_code = u32::from(unmodded.chars().next().unwrap_or(base_character));
-                },
-                _ => (),
+            //
+            // However it should only be performed when `SHIFT` is pressed.
+            if shift && alternate_key_code == unicode_key_code {
+                if let Key::Character(unmodded) = key.key_without_modifiers().as_ref() {
+                    unicode_key_code = u32::from(unmodded.chars().next().unwrap_or(unshifted_ch));
+                }
             }
 
             // NOTE: Base layouts are ignored, since winit doesn't expose this information
@@ -380,7 +417,7 @@ impl SequenceBuilder {
             {
                 format!("{unicode_key_code}:{alternate_key_code}")
             } else {
-                alternate_key_code.to_string()
+                unicode_key_code.to_string()
             };
 
             Some(SequenceBase::new(payload.into(), SequenceTerminator::Kitty))
@@ -438,45 +475,17 @@ impl SequenceBuilder {
         Some(SequenceBase::new(base.into(), SequenceTerminator::Kitty))
     }
 
-    /// Try building from [`NamedKey`].
-    fn try_build_named(&self, key: &KeyEvent) -> Option<SequenceBase> {
+    /// Try building from [`NamedKey`] using the kitty keyboard protocol encoding
+    /// for functional keys.
+    fn try_build_named_kitty(&self, key: &KeyEvent) -> Option<SequenceBase> {
         let named = match key.logical_key {
-            Key::Named(named) => named,
+            Key::Named(named) if self.kitty_seq => named,
             _ => return None,
         };
 
-        // The default parameter is 1, so we can omit it.
-        let one_based = if self.modifiers.is_empty() && !self.kitty_event_type { "" } else { "1" };
         let (base, terminator) = match named {
-            NamedKey::PageUp => ("5", SequenceTerminator::Normal('~')),
-            NamedKey::PageDown => ("6", SequenceTerminator::Normal('~')),
-            NamedKey::Insert => ("2", SequenceTerminator::Normal('~')),
-            NamedKey::Delete => ("3", SequenceTerminator::Normal('~')),
-            NamedKey::Home => (one_based, SequenceTerminator::Normal('H')),
-            NamedKey::End => (one_based, SequenceTerminator::Normal('F')),
-            NamedKey::ArrowLeft => (one_based, SequenceTerminator::Normal('D')),
-            NamedKey::ArrowRight => (one_based, SequenceTerminator::Normal('C')),
-            NamedKey::ArrowUp => (one_based, SequenceTerminator::Normal('A')),
-            NamedKey::ArrowDown => (one_based, SequenceTerminator::Normal('B')),
-            NamedKey::F1 => (one_based, SequenceTerminator::Normal('P')),
-            NamedKey::F2 => (one_based, SequenceTerminator::Normal('Q')),
-            NamedKey::F3 => {
-                // F3 in kitty protocol diverges from alacritty's terminfo.
-                if self.kitty_seq {
-                    ("13", SequenceTerminator::Normal('~'))
-                } else {
-                    (one_based, SequenceTerminator::Normal('R'))
-                }
-            },
-            NamedKey::F4 => (one_based, SequenceTerminator::Normal('S')),
-            NamedKey::F5 => ("15", SequenceTerminator::Normal('~')),
-            NamedKey::F6 => ("17", SequenceTerminator::Normal('~')),
-            NamedKey::F7 => ("18", SequenceTerminator::Normal('~')),
-            NamedKey::F8 => ("19", SequenceTerminator::Normal('~')),
-            NamedKey::F9 => ("20", SequenceTerminator::Normal('~')),
-            NamedKey::F10 => ("21", SequenceTerminator::Normal('~')),
-            NamedKey::F11 => ("23", SequenceTerminator::Normal('~')),
-            NamedKey::F12 => ("24", SequenceTerminator::Normal('~')),
+            // F3 in kitty protocol diverges from alacritty's terminfo.
+            NamedKey::F3 => ("13", SequenceTerminator::Normal('~')),
             NamedKey::F13 => ("57376", SequenceTerminator::Kitty),
             NamedKey::F14 => ("57377", SequenceTerminator::Kitty),
             NamedKey::F15 => ("57378", SequenceTerminator::Kitty),
@@ -516,6 +525,61 @@ impl SequenceBuilder {
             NamedKey::AudioVolumeDown => ("57438", SequenceTerminator::Kitty),
             NamedKey::AudioVolumeUp => ("57439", SequenceTerminator::Kitty),
             NamedKey::AudioVolumeMute => ("57440", SequenceTerminator::Kitty),
+            _ => return None,
+        };
+
+        Some(SequenceBase::new(base.into(), terminator))
+    }
+
+    /// Try building from [`NamedKey`].
+    fn try_build_named_normal(
+        &self,
+        key: &KeyEvent,
+        has_associated_text: bool,
+    ) -> Option<SequenceBase> {
+        let named = match key.logical_key {
+            Key::Named(named) => named,
+            _ => return None,
+        };
+
+        // The default parameter is 1, so we can omit it.
+        let one_based =
+            if self.modifiers.is_empty() && !self.kitty_event_type && !has_associated_text {
+                ""
+            } else {
+                "1"
+            };
+        let (base, terminator) = match named {
+            NamedKey::PageUp => ("5", SequenceTerminator::Normal('~')),
+            NamedKey::PageDown => ("6", SequenceTerminator::Normal('~')),
+            NamedKey::Insert => ("2", SequenceTerminator::Normal('~')),
+            NamedKey::Delete => ("3", SequenceTerminator::Normal('~')),
+            NamedKey::Home => (one_based, SequenceTerminator::Normal('H')),
+            NamedKey::End => (one_based, SequenceTerminator::Normal('F')),
+            NamedKey::ArrowLeft => (one_based, SequenceTerminator::Normal('D')),
+            NamedKey::ArrowRight => (one_based, SequenceTerminator::Normal('C')),
+            NamedKey::ArrowUp => (one_based, SequenceTerminator::Normal('A')),
+            NamedKey::ArrowDown => (one_based, SequenceTerminator::Normal('B')),
+            NamedKey::F1 => (one_based, SequenceTerminator::Normal('P')),
+            NamedKey::F2 => (one_based, SequenceTerminator::Normal('Q')),
+            NamedKey::F3 => (one_based, SequenceTerminator::Normal('R')),
+            NamedKey::F4 => (one_based, SequenceTerminator::Normal('S')),
+            NamedKey::F5 => ("15", SequenceTerminator::Normal('~')),
+            NamedKey::F6 => ("17", SequenceTerminator::Normal('~')),
+            NamedKey::F7 => ("18", SequenceTerminator::Normal('~')),
+            NamedKey::F8 => ("19", SequenceTerminator::Normal('~')),
+            NamedKey::F9 => ("20", SequenceTerminator::Normal('~')),
+            NamedKey::F10 => ("21", SequenceTerminator::Normal('~')),
+            NamedKey::F11 => ("23", SequenceTerminator::Normal('~')),
+            NamedKey::F12 => ("24", SequenceTerminator::Normal('~')),
+            NamedKey::F13 => ("25", SequenceTerminator::Normal('~')),
+            NamedKey::F14 => ("26", SequenceTerminator::Normal('~')),
+            NamedKey::F15 => ("28", SequenceTerminator::Normal('~')),
+            NamedKey::F16 => ("29", SequenceTerminator::Normal('~')),
+            NamedKey::F17 => ("31", SequenceTerminator::Normal('~')),
+            NamedKey::F18 => ("32", SequenceTerminator::Normal('~')),
+            NamedKey::F19 => ("33", SequenceTerminator::Normal('~')),
+            NamedKey::F20 => ("34", SequenceTerminator::Normal('~')),
             _ => return None,
         };
 
@@ -604,7 +668,7 @@ impl SequenceBase {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SequenceTerminator {
     /// The normal key esc sequence terminator defined by xterm/dec.
     Normal(char),

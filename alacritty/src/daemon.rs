@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 #[rustfmt::skip]
 #[cfg(not(windows))]
 use {
+    std::env,
     std::error::Error,
     std::os::unix::process::CommandExt,
     std::os::unix::io::RawFd,
@@ -58,16 +59,20 @@ where
 {
     let mut command = Command::new(program);
     command.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    if let Ok(cwd) = foreground_process_path(master_fd, shell_pid) {
-        command.current_dir(cwd);
-    }
+
+    let working_directory = foreground_process_path(master_fd, shell_pid).ok();
     unsafe {
         command
-            .pre_exec(|| {
+            .pre_exec(move || {
                 match libc::fork() {
                     -1 => return Err(io::Error::last_os_error()),
                     0 => (),
                     _ => libc::_exit(0),
+                }
+
+                // Copy foreground process' working directory, ignoring invalid paths.
+                if let Some(working_directory) = working_directory.as_ref() {
+                    let _ = env::set_current_dir(working_directory);
                 }
 
                 if libc::setsid() == -1 {
@@ -94,7 +99,7 @@ pub fn foreground_process_path(
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
-    let link_path = format!("/proc/{}/cwd", pid);
+    let link_path = format!("/proc/{pid}/cwd");
     #[cfg(target_os = "freebsd")]
     let link_path = format!("/compat/linux/proc/{}/cwd", pid);
 
