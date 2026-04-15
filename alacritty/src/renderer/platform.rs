@@ -110,40 +110,41 @@ pub fn create_gl_context(
     raw_window_handle: Option<RawWindowHandle>,
 ) -> GlutinResult<NotCurrentContext> {
     let debug = log::max_level() >= LevelFilter::Debug;
-    let mut builder = ContextAttributesBuilder::new().with_debug(debug);
 
-    // Try to enable robustness.
-    if gl_display.supported_features().contains(DisplayFeatures::CONTEXT_ROBUSTNESS) {
-        builder = builder.with_robustness(Robustness::RobustLoseContextOnReset);
-    }
-
-    let mut profiles = [
-        builder
-            .clone()
-            .with_context_api(ContextApi::OpenGl(Some(Version::new(3, 3))))
-            .build(raw_window_handle),
+    let apis = [
+        (ContextApi::OpenGl(Some(Version::new(3, 3))), GlProfile::Core),
         // Try gles before OpenGL 2.1 as it tends to be more stable.
-        builder
-            .clone()
-            .with_context_api(ContextApi::Gles(Some(Version::new(2, 0))))
-            .build(raw_window_handle),
-        builder
-            .with_profile(GlProfile::Compatibility)
-            .with_context_api(ContextApi::OpenGl(Some(Version::new(2, 1))))
-            .build(raw_window_handle),
-    ]
-    .into_iter();
+        (ContextApi::Gles(Some(Version::new(2, 0))), GlProfile::Core),
+        (ContextApi::OpenGl(Some(Version::new(2, 1))), GlProfile::Compatibility),
+    ];
 
-    // Try the optimal config first.
-    let mut picked_context =
-        unsafe { gl_display.create_context(gl_config, &profiles.next().unwrap()) };
+    let robustness = gl_display.supported_features().contains(DisplayFeatures::CONTEXT_ROBUSTNESS);
+    let robustness: &[Robustness] = if robustness {
+        &[Robustness::RobustLoseContextOnReset, Robustness::NotRobust]
+    } else {
+        &[Robustness::NotRobust]
+    };
 
-    // Try the fallback ones.
-    while let (Err(_), Some(profile)) = (picked_context.as_ref(), profiles.next()) {
-        picked_context = unsafe { gl_display.create_context(gl_config, &profile) };
+    // Find the first context that builds without any errors.
+    let mut error = None;
+    for (api, profile) in apis {
+        for robustness in robustness {
+            let attributes = ContextAttributesBuilder::new()
+                .with_debug(debug)
+                .with_context_api(api)
+                .with_profile(profile)
+                .with_robustness(*robustness)
+                .build(raw_window_handle);
+
+            match unsafe { gl_display.create_context(gl_config, &attributes) } {
+                Ok(profile) => return Ok(profile),
+                Err(err) => error = Some(err),
+            }
+        }
     }
 
-    picked_context
+    // If no context was built successfully, return an error for the most permissive one.
+    Err(error.unwrap())
 }
 
 pub fn create_gl_surface(
