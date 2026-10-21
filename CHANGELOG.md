@@ -19,6 +19,9 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 
 - Spurious "Failed to set new owner of XCB selection" warnings on X11
 - Lacking permissions to launch software sending Apple events
+- Off-by-one in vi mode ParagraphUp action
+- Unbounded per-cell memory usage for zero-width cells
+- Unbounded Kitty keyboard mode stack size
 
 ## 0.17.0
 
