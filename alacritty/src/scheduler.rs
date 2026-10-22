@@ -25,6 +25,7 @@ impl TimerId {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Topic {
     SelectionScrolling,
+    SmoothScroll,
     DelayedSearch,
     BlinkCursor,
     BlinkTimeout,

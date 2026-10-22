@@ -556,6 +556,7 @@ pub enum EventType {
     #[cfg(unix)]
     Shutdown,
     Frame,
+    SmoothScroll,
 }
 
 impl From<TerminalEvent> for EventType {
@@ -1843,6 +1844,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
             WinitEvent::UserEvent(Event { payload, .. }) => match payload {
                 EventType::SearchNext => self.ctx.goto_match(None),
                 EventType::Scroll(scroll) => self.ctx.scroll(scroll),
+                EventType::SmoothScroll => input::smooth_scroll::tick(&mut self.ctx),
                 EventType::BlinkCursor => {
                     // Only change state when timeout isn't reached, since we could get
                     // BlinkCursor and BlinkCursorTimeout events at the same time.
@@ -1993,6 +1995,9 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         // Reset the urgency hint when gaining focus.
                         if is_focused {
                             self.ctx.window().set_urgent(false);
+                        } else {
+                            // Key release events are lost while unfocused.
+                            input::smooth_scroll::stop(&mut self.ctx);
                         }
 
                         self.ctx.update_cursor_blinking();

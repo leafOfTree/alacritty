@@ -14,7 +14,7 @@ use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use crate::config::{Action, BindingKey, BindingMode, KeyBinding};
 use crate::display::window::ImeInhibitor;
 use crate::event::TYPING_SEARCH_DELAY;
-use crate::input::{ActionContext, Execute, Processor};
+use crate::input::{ActionContext, Execute, Processor, smooth_scroll};
 use crate::scheduler::{TimerId, Topic};
 
 impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
@@ -229,6 +229,10 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             let binding = &self.ctx.config().key_bindings()[i];
             if let Some(action) = binding_action(binding) {
                 action.execute(&mut self.ctx);
+
+                if let Action::ScrollUp | Action::ScrollDown = action {
+                    smooth_scroll::bind_key(&mut self.ctx, key.physical_key);
+                }
             }
         }
 
@@ -250,13 +254,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
     /// Handle key release.
     fn key_release(&mut self, key: KeyEvent, mode: TermMode, mods: ModifiersState) {
-        // Stop Action ScrollUp, ScrollDown 
-        let window_id = self.ctx.window().id();
-        let scheduler = self.ctx.scheduler_mut();
-        let timer_id = TimerId::new(Topic::SelectionScrolling, window_id);
-        while scheduler.scheduled(timer_id) {
-            scheduler.unschedule(timer_id);
-        }
+        smooth_scroll::release(&mut self.ctx, Some(key.physical_key));
 
         if !mode.contains(TermMode::REPORT_EVENT_TYPES)
             || mode.contains(TermMode::VI)

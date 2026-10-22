@@ -51,6 +51,7 @@ use crate::message_bar::{self, Message};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 
 pub mod keyboard;
+pub mod smooth_scroll;
 
 /// Font size change interval in px.
 pub const FONT_SIZE_STEP: f32 = 1.;
@@ -378,30 +379,8 @@ impl<T: EventListener> Execute<T> for Action {
 
                 ctx.scroll(scroll);
             },
-            Action::ScrollUp
-            | Action::ScrollDown => {
-                let window_id = ctx.window().id();
-                let scheduler = ctx.scheduler_mut();
-                let timer_id = TimerId::new(Topic::SelectionScrolling, window_id);
-                while scheduler.scheduled(timer_id) {
-                    scheduler.unschedule(timer_id);
-                }
-                let line = match self {
-                    Action::ScrollUp => 1,
-                    Action::ScrollDown => -1,
-                    _ => unreachable!()
-                };
-
-                let mut count = 0;
-                let interval_millis = 8;
-                let total = 40;
-                while count < total {
-                    let event = Event::new(EventType::Scroll(Scroll::Delta(line)), Some(window_id));
-                    let interval: Duration = Duration::from_millis(interval_millis * count);
-                    scheduler.schedule(event, interval, false, timer_id);
-                    count += 1;
-                }
-            },
+            Action::ScrollUp => smooth_scroll::start(ctx, 1),
+            Action::ScrollDown => smooth_scroll::start(ctx, -1),
             Action::ScrollLineUp => ctx.scroll(Scroll::Delta(1)),
             Action::ScrollLineDown => ctx.scroll(Scroll::Delta(-1)),
             Action::ScrollToTop => {
@@ -739,6 +718,9 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
         let timer_id = TimerId::new(Topic::SelectionScrolling, self.ctx.window().id());
         self.ctx.scheduler_mut().unschedule(timer_id);
+
+        // Stop smooth scrolling started by a mouse binding.
+        smooth_scroll::release(&mut self.ctx, None);
 
         if let MouseButton::Left | MouseButton::Right = button {
             // Copy selection on release, to prevent flooding the display server.

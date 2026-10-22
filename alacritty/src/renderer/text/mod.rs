@@ -76,10 +76,15 @@ pub trait TextRenderer<'a> {
 
     /// Resize the text rendering.
     fn resize(&self, size: &SizeInfo) {
+        self.set_scroll_offset(size, 0.);
+    }
+
+    /// Shift all text up by `offset` pixels.
+    fn set_scroll_offset(&self, size: &SizeInfo, offset: f32) {
         unsafe {
             let program = self.program();
             gl::UseProgram(program.id());
-            update_projection(program.projection_uniform(), size);
+            update_projection(program.projection_uniform(), size, offset);
             gl::UseProgram(0);
         }
     }
@@ -196,7 +201,7 @@ impl LoadGlyph for LoaderApi<'_> {
     }
 }
 
-fn update_projection(u_projection: GLint, size: &SizeInfo) {
+fn update_projection(u_projection: GLint, size: &SizeInfo, scroll_offset: f32) {
     let width = size.width();
     let height = size.height();
     let padding_x = size.padding_x();
@@ -213,7 +218,7 @@ fn update_projection(u_projection: GLint, size: &SizeInfo) {
     let scale_x = 2. / (width - 2. * padding_x);
     let scale_y = -2. / (height - 2. * padding_y);
     let offset_x = -1.;
-    let offset_y = 1.;
+    let offset_y = 1. - scroll_offset * scale_y;
 
     unsafe {
         gl::Uniform4f(u_projection, offset_x, offset_y, scale_x, scale_y);

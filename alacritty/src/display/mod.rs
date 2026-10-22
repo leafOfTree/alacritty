@@ -51,6 +51,7 @@ use crate::display::hint::{HintMatch, HintState};
 use crate::display::meter::Meter;
 use crate::display::window::Window;
 use crate::event::{Event, EventType, Mouse, SearchState};
+use crate::input::smooth_scroll::SmoothScroll;
 use crate::message_bar::{MessageBuffer, MessageType};
 use crate::renderer::rects::{RenderLine, RenderLines, RenderRect};
 use crate::renderer::{self, GlyphCache, Renderer, platform};
@@ -376,6 +377,9 @@ pub struct Display {
     /// The ime on the given display.
     pub ime: Ime,
 
+    /// Active smooth scroll triggered by a key binding.
+    pub smooth_scroll: Option<SmoothScroll>,
+
     /// The state of the timer for frame scheduling.
     pub frame_timer: FrameTimer,
 
@@ -539,6 +543,7 @@ impl Display {
             cursor_hidden: Default::default(),
             meter: Default::default(),
             ime: Default::default(),
+            smooth_scroll: Default::default(),
         })
     }
 
@@ -819,9 +824,11 @@ impl Display {
 
         // Add damage from alacritty's UI elements overlapping terminal.
 
+        let scroll_offset = self.smooth_scroll_offset(display_offset);
         let requires_full_damage = self.visual_bell.intensity() != 0.
             || self.hint_state.active()
-            || search_state.regex().is_some();
+            || search_state.regex().is_some()
+            || self.smooth_scroll.is_some();
         if requires_full_damage {
             self.damage_tracker.frame().mark_fully_damaged();
             self.damage_tracker.next_frame().mark_fully_damaged();
@@ -849,6 +856,11 @@ impl Display {
             // Ensure macOS hasn't reset our viewport.
             #[cfg(target_os = "macos")]
             self.renderer.set_viewport(&size_info);
+
+            // Shift the grid while smooth scrolling.
+            if scroll_offset != 0. {
+                self.renderer.set_scroll_offset(&size_info, scroll_offset);
+            }
 
             let glyph_cache = &mut self.glyph_cache;
             let highlighted_hint = &self.highlighted_hint;
@@ -880,6 +892,18 @@ impl Display {
 
         let mut rects = lines.rects(&metrics, &size_info);
 
+        // Draw cursor.
+        rects.extend(cursor.rects(&size_info, config.cursor.thickness()));
+
+        // Draw rects attached to the grid with the same offset, before UI elements are added.
+        if scroll_offset != 0. {
+            for rect in &mut rects {
+                rect.y -= scroll_offset;
+            }
+            self.renderer.draw_rects(&size_info, &metrics, mem::take(&mut rects));
+            self.renderer.set_scroll_offset(&size_info, 0.);
+        }
+
         if let Some(vi_cursor_point) = vi_cursor_point {
             // Indicate vi mode by showing the cursor's position in the top right corner.
             let line = (-vi_cursor_point.line.0 + size_info.bottommost_line().0) as usize;
@@ -891,9 +915,6 @@ impl Display {
             // Show current display offset in vi-less search to indicate match position.
             self.draw_line_indicator(config, total_lines, None, display_offset);
         };
-
-        // Draw cursor.
-        rects.extend(cursor.rects(&size_info, config.cursor.thickness()));
 
         // Push visual bell after url/underline/strikeout rects.
         let visual_bell_intensity = self.visual_bell.intensity();
@@ -1431,12 +1452,17 @@ impl Display {
         }
     }
 
-    /// Request a new frame for a window on Wayland.
-    fn request_frame(&mut self, scheduler: &mut Scheduler) {
-        // Mark that we've used a frame.
-        self.window.has_frame = false;
+    /// Number of pixels the grid is shifted up by an active smooth scroll.
+    pub fn smooth_scroll_offset(&self, display_offset: usize) -> f32 {
+        // The line revealed below the viewport only exists while scrolled into history.
+        match &self.smooth_scroll {
+            Some(scroll) if display_offset > 0 => scroll.pixel_offset(self.size_info.cell_height()),
+            _ => 0.,
+        }
+    }
 
-        // Get the display vblank interval.
+    /// Get the vblank interval of the window's monitor.
+    pub fn vblank_interval(&self) -> Duration {
         let monitor_vblank_interval = 1_000_000.
             / self
                 .window
@@ -1445,9 +1471,15 @@ impl Display {
                 .unwrap_or(60_000) as f64;
 
         // Now convert it to micro seconds.
-        let monitor_vblank_interval =
-            Duration::from_micros((1000. * monitor_vblank_interval) as u64);
+        Duration::from_micros((1000. * monitor_vblank_interval) as u64)
+    }
 
+    /// Request a new frame for a window on Wayland.
+    fn request_frame(&mut self, scheduler: &mut Scheduler) {
+        // Mark that we've used a frame.
+        self.window.has_frame = false;
+
+        let monitor_vblank_interval = self.vblank_interval();
         let swap_timeout = self.frame_timer.compute_timeout(monitor_vblank_interval);
 
         let window_id = self.window.id();

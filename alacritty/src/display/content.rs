@@ -35,6 +35,9 @@ pub struct RenderableContent<'a> {
     colors: &'a List,
     focused_match: Option<&'a Match>,
     size: &'a SizeInfo,
+
+    /// Last line to render, including the line below the viewport while smooth scrolling.
+    last_line: Line,
 }
 
 impl<'a> RenderableContent<'a> {
@@ -46,7 +49,16 @@ impl<'a> RenderableContent<'a> {
     ) -> Self {
         let search = search_state.dfas().map(|dfas| HintMatches::visible_regex_matches(term, dfas));
         let focused_match = search_state.focused_match();
-        let terminal_content = term.renderable_content();
+        let mut terminal_content = term.renderable_content();
+
+        // Include the line below the viewport, which is partially revealed while smooth scrolling.
+        let display_offset = terminal_content.display_offset;
+        let mut last_line = Line(term.screen_lines() as i32 - display_offset as i32 - 1);
+        if display.smooth_scroll_offset(display_offset) != 0. {
+            let start = Point::new(Line(-(display_offset as i32) - 1), term.last_column());
+            terminal_content.display_iter = term.grid().iter_from(start);
+            last_line += 1;
+        }
 
         // Find terminal cursor shape.
         let cursor_shape = if terminal_content.cursor.shape == CursorShape::Hidden
@@ -63,7 +75,6 @@ impl<'a> RenderableContent<'a> {
 
         // Convert terminal cursor point to viewport position.
         let cursor_point = terminal_content.cursor.point;
-        let display_offset = terminal_content.display_offset;
         let cursor_point = term::point_to_viewport(display_offset, cursor_point).unwrap();
 
         let hint = if display.hint_state.active() {
@@ -81,6 +92,7 @@ impl<'a> RenderableContent<'a> {
             focused_match,
             cursor_shape,
             cursor_point,
+            last_line,
             search,
             config,
             hint,
@@ -161,6 +173,10 @@ impl Iterator for RenderableContent<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let cell = self.terminal_content.display_iter.next()?;
+            if cell.point.line > self.last_line {
+                return None;
+            }
+
             let mut cell = RenderableCell::new(self, cell);
 
             if self.cursor_point == cell.point {

@@ -12,6 +12,7 @@ use glutin::display::{GetGlDisplay, GlDisplay};
 use log::{LevelFilter, debug, info};
 use unicode_width::UnicodeWidthChar;
 
+use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::Point;
 use alacritty_terminal::term::cell::Flags;
 
@@ -336,6 +337,30 @@ impl Renderer {
                 size.width() as i32 - 2 * size.padding_x() as i32,
                 size.height() as i32 - 2 * size.padding_y() as i32,
             );
+        }
+    }
+
+    /// Shift the terminal grid up by `offset` pixels, clipping it to the text area.
+    ///
+    /// This affects text drawn by the renderer and all rectangles via the scissor box, so it must
+    /// be reset to `0.` before drawing UI elements outside of the grid.
+    pub fn set_scroll_offset(&self, size_info: &SizeInfo, offset: f32) {
+        match &self.text_renderer {
+            TextRendererProvider::Gles2(renderer) => renderer.set_scroll_offset(size_info, offset),
+            TextRendererProvider::Glsl3(renderer) => renderer.set_scroll_offset(size_info, offset),
+        }
+
+        unsafe {
+            if offset == 0. {
+                gl::Disable(gl::SCISSOR_TEST);
+                return;
+            }
+
+            // Scissor box origin is the bottom-left corner of the window.
+            let text_height = size_info.screen_lines() as f32 * size_info.cell_height();
+            let bottom = size_info.height() - size_info.padding_y() - text_height;
+            gl::Enable(gl::SCISSOR_TEST);
+            gl::Scissor(0, bottom as i32, size_info.width() as i32, text_height as i32);
         }
     }
 
